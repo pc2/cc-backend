@@ -183,6 +183,11 @@
       {/each}
     </p>
   {/if}
+  {#if job?.metaData?.issues}
+    <p class="mb-1">
+	More about Issues in our <a href="https://pc2.uni-paderborn.de/go/jobmon-issues">Documentation</a>.
+    </p>
+  {/if}
 </div>
 
 <style>
