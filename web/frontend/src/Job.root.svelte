@@ -247,6 +247,17 @@
               <JobInfo job={thisJob} {username} {authlevel} {roles} showTagEdit/>
             </CardBody>
           </TabPane>
+          {#if $initq.data?.job?.metaData?.issues}
+            <TabPane tabId="admin-msg" tab="Issues">
+              <CardBody>
+                  <div>
+                  <p class="mb-2">
+                  {@html $initq.data.job.metaData.issues}
+                  </p>
+                  </div>
+              </CardBody>
+            </TabPane>
+          {/if}
           {#if thisJob.concurrentJobs != null && thisJob.concurrentJobs.items.length != 0}
             <TabPane  tabId="shared-jobs">
               <span slot="tab">
