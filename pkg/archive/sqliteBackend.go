@@ -102,7 +102,7 @@ func (sa *SqliteArchive) Init(rawConfig json.RawMessage) (uint64, error) {
 		"PRAGMA journal_mode=WAL",
 		"PRAGMA synchronous=NORMAL",
 		"PRAGMA cache_size=-64000", // 64MB cache
-		"PRAGMA busy_timeout=5000",
+		"PRAGMA busy_timeout=60000",
 	}
 	for _, pragma := range pragmas {
 		if _, err := sa.db.Exec(pragma); err != nil {
@@ -576,9 +576,7 @@ func (sa *SqliteArchive) Iter(loadMetricData bool) <-chan JobContainer {
 		var wg sync.WaitGroup
 
 		for range numWorkers {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				for row := range jobRows {
 					job, err := DecodeJobMeta(bytes.NewReader(row.metaBlob))
 					if err != nil {
@@ -617,7 +615,7 @@ func (sa *SqliteArchive) Iter(loadMetricData bool) <-chan JobContainer {
 						ch <- JobContainer{Meta: job, Data: nil}
 					}
 				}
-			}()
+			})
 		}
 
 		for {

@@ -66,6 +66,8 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"sync"
@@ -159,7 +161,10 @@ func scanJob(row interface{ Scan(...any) error }) (*schema.Job, error) {
 		&job.StartTime, &job.Partition, &job.ArrayJobID, &job.NumNodes, &job.NumHWThreads,
 		&job.NumAcc, &job.Shared, &job.MonitoringStatus, &job.SMT, &job.State,
 		&job.Duration, &job.Walltime, &job.RawResources, &job.RawFootprint, &job.Energy); err != nil {
-		cclog.Warnf("Error while scanning rows (Job): %v", err)
+		if err != sql.ErrNoRows {
+			_, file, line, _ := runtime.Caller(1)
+			cclog.Warnf("Error while scanning rows (Job) (%s:%d): %v", filepath.Base(file), line, err)
+		}
 		return nil, err
 	}
 
@@ -718,7 +723,7 @@ func (r *JobRepository) StopJobsExceedingWalltimeBy(seconds int) error {
 		Set("job_state", schema.JobStateFailed).
 		Where("job.job_state = 'running'").
 		Where("job.walltime > 0").
-		Where("(? - job.start_time) > (job.walltime + ?)", currentTime, seconds).
+		Where("job.start_time < (? - job.walltime)", currentTime-int64(seconds)).
 		RunWith(r.DB).Exec()
 	if err != nil {
 		cclog.Warnf("Error while stopping jobs exceeding walltime: %v", err)
@@ -1066,7 +1071,7 @@ func (r *JobRepository) GetUsedNodes(ts int64) (map[string][]string, error) {
 	// Note: Query expects index on (job_state, start_time) for optimal performance
 	q := sq.Select("job.cluster", "job.resources").From("job").
 		Where("job.start_time < ?", ts).
-		Where(sq.Eq{"job.job_state": "running"})
+		Where("job.job_state = 'running'")
 
 	rows, err := q.RunWith(r.stmtCache).Query()
 	if err != nil {

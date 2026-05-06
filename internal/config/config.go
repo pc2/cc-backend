@@ -77,6 +77,18 @@ type ProgramConfig struct {
 
 	// Node state retention configuration
 	NodeStateRetention *NodeStateRetention `json:"nodestate-retention"`
+
+	// Database tuning configuration
+	DbConfig *DbConfig `json:"db-config"`
+}
+
+type DbConfig struct {
+	CacheSizeMB               int `json:"cache-size-mb"`
+	SoftHeapLimitMB           int `json:"soft-heap-limit-mb"`
+	MaxOpenConnections        int `json:"max-open-connections"`
+	MaxIdleConnections        int `json:"max-idle-connections"`
+	ConnectionMaxIdleTimeMins int `json:"max-idle-time-minutes"`
+	BusyTimeoutMs             int `json:"busy-timeout-ms"`
 }
 
 type NodeStateRetention struct {
@@ -105,6 +117,8 @@ type ResampleConfig struct {
 type NATSConfig struct {
 	SubjectJobEvent  string `json:"subject-job-event"`
 	SubjectNodeState string `json:"subject-node-state"`
+	JobConcurrency   int    `json:"job-concurrency"`
+	NodeConcurrency  int    `json:"node-concurrency"`
 }
 
 type IntRange struct {

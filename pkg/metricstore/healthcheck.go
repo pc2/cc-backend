@@ -66,7 +66,10 @@ func (l *Level) collectMetricStatus(m *MemoryStore, expectedMetrics []string, he
 		if degraded[metricName] {
 			continue // already degraded, cannot improve
 		}
-		mc := m.Metrics[metricName]
+		mc, ok := m.Metrics[metricName]
+		if !ok {
+			continue // unknown metric, will be reported as missing
+		}
 		b := l.metrics[mc.offset]
 		if b.bufferExists() {
 			if !b.isBufferHealthy() {
@@ -166,10 +169,10 @@ func (m *MemoryStore) HealthCheck(cluster string,
 		healthyCount := len(expectedMetrics) - degradedCount - missingCount
 
 		if degradedCount > 0 {
-			cclog.ComponentInfo("metricstore", "HealthCheck: node ", hostname, "degraded metrics:", degradedList)
+			cclog.ComponentDebug("metricstore", "HealthCheck: node ", hostname, "degraded metrics:", degradedList)
 		}
 		if missingCount > 0 {
-			cclog.ComponentInfo("metricstore", "HealthCheck: node ", hostname, "missing metrics:", missingList)
+			cclog.ComponentDebug("metricstore", "HealthCheck: node ", hostname, "missing metrics:", missingList)
 		}
 
 		var state schema.MonitoringState

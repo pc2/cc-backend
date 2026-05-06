@@ -171,7 +171,7 @@ func (r *JobRepository) FindByID(ctx context.Context, jobID int64) (*schema.Job,
 		return nil, qerr
 	}
 
-	return scanJob(q.RunWith(r.stmtCache).QueryRow())
+	return scanJob(q.RunWith(r.stmtCache).QueryRowContext(ctx))
 }
 
 // FindByIDWithUser executes a SQL query to find a specific batch job.
@@ -217,7 +217,7 @@ func (r *JobRepository) FindByJobID(ctx context.Context, jobID int64, startTime 
 		return nil, qerr
 	}
 
-	return scanJob(q.RunWith(r.stmtCache).QueryRow())
+	return scanJob(q.RunWith(r.stmtCache).QueryRowContext(ctx))
 }
 
 // IsJobOwner checks if the specified user owns the batch job identified by jobID,
@@ -270,24 +270,21 @@ func (r *JobRepository) FindConcurrentJobs(
 		stopTime = startTime + int64(job.Duration)
 	}
 
-	// Time buffer constants for finding overlapping jobs
-	// overlapBufferStart: 10s grace period at job start to catch jobs starting just after
+	// Time buffer constant for finding overlapping jobs
 	// overlapBufferEnd: 200s buffer at job end to account for scheduling/cleanup overlap
-	const overlapBufferStart = 10
 	const overlapBufferEnd = 200
 
-	startTimeTail := startTime + overlapBufferStart
 	stopTimeTail := stopTime - overlapBufferEnd
 	startTimeFront := startTime + overlapBufferEnd
 
-	// Reminder: BETWEEN Queries are slower and dont use indices as frequently: Can this be optimized?
-	queryRunning := query.Where("job.job_state = ?").Where("(job.start_time BETWEEN ? AND ? OR job.start_time < ?)",
-		"running", startTimeTail, stopTimeTail, startTime)
+	queryRunning := query.Where("job.job_state = ?", "running").
+		Where("job.start_time <= ?", stopTimeTail)
 	// Get At Least One Exact Hostname Match from JSON Resources Array in Database
 	queryRunning = queryRunning.Where("EXISTS (SELECT 1 FROM json_each(job.resources) WHERE json_extract(value, '$.hostname') = ?)", hostname)
 
-	query = query.Where("job.job_state != ?").Where("((job.start_time BETWEEN ? AND ?) OR (job.start_time + job.duration) BETWEEN ? AND ? OR (job.start_time < ?) AND (job.start_time + job.duration) > ?)",
-		"running", startTimeTail, stopTimeTail, startTimeFront, stopTimeTail, startTime, stopTime)
+	query = query.Where("job.job_state != ?", "running").
+		Where("job.start_time < ?", stopTimeTail).
+		Where("(job.start_time + job.duration) > ?", startTimeFront)
 	// Get At Least One Exact Hostname Match from JSON Resources Array in Database
 	query = query.Where("EXISTS (SELECT 1 FROM json_each(job.resources) WHERE json_extract(value, '$.hostname') = ?)", hostname)
 

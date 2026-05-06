@@ -18,8 +18,10 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/99designs/gqlgen/graphql"
 	"github.com/99designs/gqlgen/graphql/handler"
 	"github.com/99designs/gqlgen/graphql/handler/transport"
 	"github.com/99designs/gqlgen/graphql/playground"
@@ -88,6 +90,12 @@ func (s *Server) init() error {
 		generated.NewExecutableSchema(generated.Config{Resolvers: resolver}))
 
 	graphQLServer.AddTransport(transport.POST{})
+
+	// Inject a per-request stats cache so that grouped statistics queries
+	// sharing the same (filter, groupBy) pair are executed only once.
+	graphQLServer.AroundOperations(func(ctx context.Context, next graphql.OperationHandler) graphql.ResponseHandler {
+		return next(graph.WithStatsGroupCache(ctx))
+	})
 
 	if os.Getenv(envDebug) != "1" {
 		// Having this handler means that a error message is returned via GraphQL instead of the connection simply beeing closed.
@@ -337,20 +345,20 @@ func (s *Server) init() error {
 
 // Server timeout defaults (in seconds)
 const (
-	defaultReadTimeout  = 20
-	defaultWriteTimeout = 20
+	defaultReadHeaderTimeout = 20
+	defaultWriteTimeout      = 20
 )
 
 func (s *Server) Start(ctx context.Context) error {
 	// Use configurable timeouts with defaults
-	readTimeout := time.Duration(defaultReadTimeout) * time.Second
+	readHeaderTimeout := time.Duration(defaultReadHeaderTimeout) * time.Second
 	writeTimeout := time.Duration(defaultWriteTimeout) * time.Second
 
 	s.server = &http.Server{
-		ReadTimeout:  readTimeout,
-		WriteTimeout: writeTimeout,
-		Handler:      s.router,
-		Addr:         config.Keys.Addr,
+		ReadHeaderTimeout: readHeaderTimeout,
+		WriteTimeout:      writeTimeout,
+		Handler:           s.router,
+		Addr:              config.Keys.Addr,
 	}
 
 	// Start http or https server
@@ -392,16 +400,6 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("dropping privileges: %w", err)
 	}
 
-	// Handle context cancellation for graceful shutdown
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := s.server.Shutdown(shutdownCtx); err != nil {
-			cclog.Errorf("Server shutdown error: %v", err)
-		}
-	}()
-
 	if err = s.server.Serve(listener); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("server failed: %w", err)
 	}
@@ -409,25 +407,53 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 func (s *Server) Shutdown(ctx context.Context) {
-	// Create a shutdown context with timeout
-	shutdownCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
+	shutdownStart := time.Now()
 
+	natsStart := time.Now()
 	nc := nats.GetClient()
 	if nc != nil {
 		nc.Close()
 	}
+	cclog.Infof("Shutdown: NATS closed (%v)", time.Since(natsStart))
 
-	// First shut down the server gracefully (waiting for all ongoing requests)
+	httpStart := time.Now()
+	shutdownCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
 	if err := s.server.Shutdown(shutdownCtx); err != nil {
 		cclog.Errorf("Server shutdown error: %v", err)
 	}
+	cclog.Infof("Shutdown: HTTP server stopped (%v)", time.Since(httpStart))
 
-	// Archive all the metric store data
-	metricstore.Shutdown()
+	// Run metricstore and archiver shutdown concurrently.
+	// They are independent: metricstore writes .bin snapshots,
+	// archiver flushes pending job archives.
+	storeStart := time.Now()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var wg sync.WaitGroup
 
-	// Shutdown archiver with 10 second timeout for fast shutdown
-	if err := archiver.Shutdown(10 * time.Second); err != nil {
-		cclog.Warnf("Archiver shutdown: %v", err)
+		if ms := metricstore.GetMemoryStore(); ms != nil {
+			wg.Go(func() {
+				metricstore.Shutdown()
+			})
+		}
+
+		wg.Go(func() {
+			if err := archiver.Shutdown(60 * time.Second); err != nil {
+				cclog.Warnf("Archiver shutdown: %v", err)
+			}
+		})
+
+		wg.Wait()
+	}()
+
+	select {
+	case <-done:
+		cclog.Infof("Shutdown: metricstore + archiver completed (%v)", time.Since(storeStart))
+	case <-time.After(60 * time.Second):
+		cclog.Warnf("Shutdown deadline exceeded after %v, forcing exit", time.Since(shutdownStart))
 	}
+
+	cclog.Infof("Shutdown: total time %v", time.Since(shutdownStart))
 }

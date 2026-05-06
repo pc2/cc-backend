@@ -305,30 +305,66 @@ func buildFilterPresets(query url.Values) map[string]any {
 	if query.Get("numNodes") != "" {
 		parts := strings.Split(query.Get("numNodes"), "-")
 		if len(parts) == 2 {
-			a, e1 := strconv.Atoi(parts[0])
-			b, e2 := strconv.Atoi(parts[1])
-			if e1 == nil && e2 == nil {
-				filterPresets["numNodes"] = map[string]int{"from": a, "to": b}
+			if parts[0] == "lessthan" {
+				lt, lte := strconv.Atoi(parts[1])
+				if lte == nil {
+					filterPresets["numNodes"] = map[string]int{"from": 0, "to": lt}
+				}
+			} else if parts[0] == "morethan" {
+				mt, mte := strconv.Atoi(parts[1])
+				if mte == nil {
+					filterPresets["numNodes"] = map[string]int{"from": mt, "to": 0}
+				}
+			} else {
+				a, e1 := strconv.Atoi(parts[0])
+				b, e2 := strconv.Atoi(parts[1])
+				if e1 == nil && e2 == nil {
+					filterPresets["numNodes"] = map[string]int{"from": a, "to": b}
+				}
 			}
 		}
 	}
 	if query.Get("numHWThreads") != "" {
 		parts := strings.Split(query.Get("numHWThreads"), "-")
 		if len(parts) == 2 {
-			a, e1 := strconv.Atoi(parts[0])
-			b, e2 := strconv.Atoi(parts[1])
-			if e1 == nil && e2 == nil {
-				filterPresets["numHWThreads"] = map[string]int{"from": a, "to": b}
+			if parts[0] == "lessthan" {
+				lt, lte := strconv.Atoi(parts[1])
+				if lte == nil {
+					filterPresets["numHWThreads"] = map[string]int{"from": 0, "to": lt}
+				}
+			} else if parts[0] == "morethan" {
+				mt, mte := strconv.Atoi(parts[1])
+				if mte == nil {
+					filterPresets["numHWThreads"] = map[string]int{"from": mt, "to": 0}
+				}
+			} else {
+				a, e1 := strconv.Atoi(parts[0])
+				b, e2 := strconv.Atoi(parts[1])
+				if e1 == nil && e2 == nil {
+					filterPresets["numHWThreads"] = map[string]int{"from": a, "to": b}
+				}
 			}
 		}
 	}
 	if query.Get("numAccelerators") != "" {
 		parts := strings.Split(query.Get("numAccelerators"), "-")
 		if len(parts) == 2 {
-			a, e1 := strconv.Atoi(parts[0])
-			b, e2 := strconv.Atoi(parts[1])
-			if e1 == nil && e2 == nil {
-				filterPresets["numAccelerators"] = map[string]int{"from": a, "to": b}
+			if parts[0] == "lessthan" {
+				lt, lte := strconv.Atoi(parts[1])
+				if lte == nil {
+					filterPresets["numAccelerators"] = map[string]int{"from": 0, "to": lt}
+				}
+			} else if parts[0] == "morethan" {
+				mt, mte := strconv.Atoi(parts[1])
+				if mte == nil {
+					filterPresets["numAccelerators"] = map[string]int{"from": mt, "to": 0}
+				}
+			} else {
+				a, e1 := strconv.Atoi(parts[0])
+				b, e2 := strconv.Atoi(parts[1])
+				if e1 == nil && e2 == nil {
+					filterPresets["numAccelerators"] = map[string]int{"from": a, "to": b}
+				}
 			}
 		}
 	}
@@ -369,10 +405,22 @@ func buildFilterPresets(query url.Values) map[string]any {
 	if query.Get("energy") != "" {
 		parts := strings.Split(query.Get("energy"), "-")
 		if len(parts) == 2 {
-			a, e1 := strconv.Atoi(parts[0])
-			b, e2 := strconv.Atoi(parts[1])
-			if e1 == nil && e2 == nil {
-				filterPresets["energy"] = map[string]int{"from": a, "to": b}
+			if parts[0] == "lessthan" {
+				lt, lte := strconv.Atoi(parts[1])
+				if lte == nil {
+					filterPresets["energy"] = map[string]int{"from": 0, "to": lt}
+				}
+			} else if parts[0] == "morethan" {
+				mt, mte := strconv.Atoi(parts[1])
+				if mte == nil {
+					filterPresets["energy"] = map[string]int{"from": mt, "to": 0}
+				}
+			} else {
+				a, e1 := strconv.Atoi(parts[0])
+				b, e2 := strconv.Atoi(parts[1])
+				if e1 == nil && e2 == nil {
+					filterPresets["energy"] = map[string]int{"from": a, "to": b}
+				}
 			}
 		}
 	}
@@ -381,15 +429,37 @@ func buildFilterPresets(query url.Values) map[string]any {
 		for _, statEntry := range query["stat"] {
 			parts := strings.Split(statEntry, "-")
 			if len(parts) == 3 { // Metric Footprint Stat Field, from - to
-				a, e1 := strconv.ParseInt(parts[1], 10, 64)
-				b, e2 := strconv.ParseInt(parts[2], 10, 64)
-				if e1 == nil && e2 == nil {
-					statEntry := map[string]any{
-						"field": parts[0],
-						"from":  a,
-						"to":    b,
+				if parts[1] == "lessthan" {
+					lt, lte := strconv.ParseInt(parts[2], 10, 64)
+					if lte == nil {
+						statEntry := map[string]any{
+							"field": parts[0],
+							"from":  0,
+							"to":    lt,
+						}
+						statList = append(statList, statEntry)
 					}
-					statList = append(statList, statEntry)
+				} else if parts[1] == "morethan" {
+					mt, mte := strconv.ParseInt(parts[2], 10, 64)
+					if mte == nil {
+						statEntry := map[string]any{
+							"field": parts[0],
+							"from":  mt,
+							"to":    0,
+						}
+						statList = append(statList, statEntry)
+					}
+				} else {
+					a, e1 := strconv.ParseInt(parts[1], 10, 64)
+					b, e2 := strconv.ParseInt(parts[2], 10, 64)
+					if e1 == nil && e2 == nil {
+						statEntry := map[string]any{
+							"field": parts[0],
+							"from":  a,
+							"to":    b,
+						}
+						statList = append(statList, statEntry)
+					}
 				}
 			}
 		}

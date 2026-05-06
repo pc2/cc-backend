@@ -127,7 +127,7 @@ func (data *APIMetricData) AddStats() {
 // This is commonly used for unit conversion (e.g., bytes to gigabytes).
 // Scaling by 0 or 1 is a no-op for performance reasons.
 func (data *APIMetricData) ScaleBy(f schema.Float) {
-	if f == 0 || f == 1 {
+	if f == 1 {
 		return
 	}
 
@@ -288,7 +288,7 @@ func FetchData(req APIQueryRequest) (*APIQueryResponse, error) {
 					data.Error = &msg
 					res = append(res, data)
 				} else {
-					cclog.Warnf("failed to fetch '%s' from host '%s' (cluster: %s): %s", query.Metric, query.Hostname, req.Cluster, err.Error())
+					cclog.Debugf("failed to fetch '%s' from host '%s' (cluster: %s): %s", query.Metric, query.Hostname, req.Cluster, err.Error())
 				}
 				continue
 			}

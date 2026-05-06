@@ -34,6 +34,7 @@
     formatDurationTime
   } from "./generic/units.js";
   import Filters from "./generic/Filters.svelte";
+  import Pagination from "./generic/joblist/Pagination.svelte";
 
   /* Svelte 5 Props */
   let {
@@ -51,6 +52,8 @@
   let jobFilters = $state([]);
   let nameFilter = $state("");
   let sorting = $state({ field: "totalJobs", direction: "desc" });
+  let page = $state(1);
+  let itemsPerPage = $state(25);
 
   /* Derived Vars */
   const fetchRunning = $derived(jobFilters.some(jf => jf?.state?.length == 1 && jf?.state?.includes("running")));
@@ -61,6 +64,15 @@
     }
     return colbase
   })
+  const sortedRows = $derived(
+    $stats.data ? sort($stats.data.rows, sorting, nameFilter) : []
+  );
+  const paginatedRows = $derived(
+    sortedRows.slice((page - 1) * itemsPerPage, page * itemsPerPage)
+  );
+
+  /* Reset page when sorting or filter changes */
+  $effect(() => { sorting; nameFilter; page = 1; });
 
   let stats = $derived(
     queryStore({
@@ -87,6 +99,40 @@
   );
 
   /* Functions */
+  function exportCsv() {
+    const isUser = type === "USER";
+    const header = [
+      isUser ? "Username" : "Project",
+      ...(isUser ? ["Name"] : []),
+      "Total Jobs",
+      "Short Jobs",
+      ...(fetchRunning ? ["Total Cores", "Total Accelerators"] : []),
+      "Total Walltime",
+      "Total Core Hours",
+      "Total Accelerator Hours",
+    ];
+    const rows = sortedRows.map((row) => [
+      row.id,
+      ...(isUser ? [row?.name ?? ""] : []),
+      row.totalJobs,
+      row.shortJobs,
+      ...(fetchRunning ? [row.totalCores, row.totalAccs] : []),
+      row.totalWalltime,
+      row.totalCoreHours,
+      row.totalAccHours,
+    ]);
+    const csv = [header, ...rows]
+      .map((row) => row.map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`).join(","))
+      .join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${type.toLowerCase()}s.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
   function changeSorting(newField) {
     if (sorting.field == newField) {
       // Same Field, Change Direction
@@ -137,6 +183,14 @@
           PROJECT: 'project',
         }[type]}"
       />
+      <Button
+        color="success"
+        title="Export current view as CSV"
+        disabled={!$stats.data}
+        onclick={() => exportCsv()}
+      >
+        <Icon name="download" /> CSV
+      </Button>
     </InputGroup>
   </Col>
   <Col xs="12" md="7" lg="8" xl="9">
@@ -315,7 +369,7 @@
         >
       </tr>
     {:else if $stats.data}
-      {#each sort($stats.data.rows, sorting, nameFilter) as row (row.id)}
+      {#each paginatedRows as row (row.id)}
         <tr>
           <td>
             {#if type == "USER"}
@@ -357,3 +411,16 @@
     {/if}
   </tbody>
 </Table>
+{#if sortedRows.length > 0}
+  <Pagination
+    {page}
+    {itemsPerPage}
+    totalItems={sortedRows.length}
+    itemText={type === 'USER' ? 'Users' : 'Projects'}
+    pageSizes={[25, 50, 100]}
+    updatePaging={(detail) => {
+      itemsPerPage = detail.itemsPerPage;
+      page = detail.page;
+    }}
+  />
+{/if}

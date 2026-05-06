@@ -42,7 +42,7 @@ func (b *buffer) stats(from, to int64) (Stats, int64, int64, error) {
 			if b == nil {
 				break
 			}
-			idx = 0
+			idx = int((t - b.start) / b.frequency)
 		}
 
 		if t < b.start || idx >= len(b.data) {
@@ -91,8 +91,10 @@ func (m *MemoryStore) Stats(selector util.Selector, metric string, from, to int6
 
 		if n == 0 {
 			from, to = cfrom, cto
-		} else if from != cfrom || to != cto {
-			return ErrDataDoesNotAlign
+		} else if from != cfrom {
+			return ErrDataDoesNotAlignMissingFront
+		} else if to != cto {
+			return ErrDataDoesNotAlignMissingBack
 		}
 
 		samples += stats.Samples

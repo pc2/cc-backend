@@ -20,7 +20,9 @@
     ModalBody,
     ModalHeader,
     ModalFooter,
-    Input
+    Input,
+    Tooltip,
+    Icon
   } from "@sveltestrap/sveltestrap";
   import DoubleRangeSlider from "../select/DoubleRangeSlider.svelte";
 
@@ -41,6 +43,19 @@
     eq: "Equal To",
     contains: "Contains",
   }
+
+  const findMaxNumNodes = (infos) =>
+    infos.reduce(
+      (max, cluster) =>
+        Math.max(
+          max,
+          cluster.subClusters.reduce(
+            (max, sc) => Math.max(max, sc.numberOfNodes || 0),
+            0,
+          ),
+        ),
+      0,
+    );
 
   const findMaxNumAccels = (infos) =>
     infos.reduce(
@@ -75,96 +90,88 @@
 
   /* State Init*/
   // Counts
-  let minNumNodes = $state(1);
-  let maxNumNodes = $state(128);
-  let maxNumHWThreads = $state(0);
-  let maxNumAccelerators = $state(0);
+  let maxNumNodes = $state(1);
+  let maxNumHWThreads = $state(1);
+  let maxNumAccelerators = $state(1);
 
   /* Derived States */
   // Pending
-  let pendingNumNodes = $derived(presetNumNodes);
-  let pendingNumHWThreads = $derived(presetNumHWThreads);
-  let pendingNumAccelerators = $derived(presetNumAccelerators);
+  let pendingNumNodes = $derived({
+    from: presetNumNodes.from,
+    to: (presetNumNodes.to == 0) ? null : presetNumNodes.to
+  });
+  let pendingNumHWThreads = $derived({
+    from: presetNumHWThreads.from,
+    to: (presetNumHWThreads.to == 0) ? null : presetNumHWThreads.to
+  });
+  let pendingNumAccelerators = $derived({
+    from: presetNumAccelerators.from,
+    to: (presetNumAccelerators.to == 0) ? null : presetNumAccelerators.to
+  });
   let pendingNamedNode = $derived(presetNamedNode);
   let pendingNodeMatch = $derived(presetNodeMatch);
   // Changable States
-  let nodesState = $derived(presetNumNodes);
-  let threadState = $derived(presetNumHWThreads);
-  let accState = $derived(presetNumAccelerators);
+  let nodesState = $derived({
+    from: presetNumNodes?.from || 0,
+    to: (presetNumNodes.to == 0) ? null : presetNumNodes.to
+  });
+  let threadState = $derived({
+    from: presetNumHWThreads?.from || 0,
+    to: (presetNumHWThreads.to == 0) ? null : presetNumHWThreads.to
+  });
+  let accState = $derived({
+    from: presetNumAccelerators?.from || 0,
+    to: (presetNumAccelerators.to == 0) ? null : presetNumAccelerators.to
+  });
 
   const initialized = $derived(getContext("initialized") || false);
   const clusterInfos = $derived($initialized ? getContext("clusters") : null);
   // Is Selection Active
-  const nodesActive = $derived(!(JSON.stringify(nodesState) === JSON.stringify({ from: 1, to: maxNumNodes })));
-  const threadActive = $derived(!(JSON.stringify(threadState) === JSON.stringify({ from: 1, to: maxNumHWThreads })));
-  const accActive = $derived(!(JSON.stringify(accState) === JSON.stringify({ from: 0, to: maxNumAccelerators })));
-  // Block Apply if null
-  const disableApply = $derived(
-    nodesState.from === null || nodesState.to === null ||
-    threadState.from === null || threadState.to === null ||
-    accState.from === null || accState.to === null
-  );
+  const nodesActive = $derived(!(JSON.stringify(nodesState) === JSON.stringify({ from: 0, to: null })));
+  const threadActive = $derived(!(JSON.stringify(threadState) === JSON.stringify({ from: 0, to: null })));
+  const accActive = $derived(!(JSON.stringify(accState) === JSON.stringify({ from: 0, to: null })));
 
   /* Reactive Effects | Svelte 5 onMount */
   $effect(() => {
     if ($initialized) {
       if (activeCluster != null) {
         const { subClusters } = clusterInfos.find((c) => c.name == activeCluster);
-        maxNumAccelerators = findMaxNumAccels([{ subClusters }]);
+        maxNumNodes = findMaxNumNodes([{ subClusters }]);
         maxNumHWThreads = findMaxNumHWThreadsPerNode([{ subClusters }]);
+        maxNumAccelerators = findMaxNumAccels([{ subClusters }]);
       } else if (clusterInfos.length > 0) {
-        maxNumAccelerators = findMaxNumAccels(clusterInfos);
+        maxNumNodes = findMaxNumNodes(clusterInfos);
         maxNumHWThreads = findMaxNumHWThreadsPerNode(clusterInfos);
+        maxNumAccelerators = findMaxNumAccels(clusterInfos);
       }
-    }
-  });
-
-  $effect(() => {
-    if (
-      $initialized &&
-      pendingNumNodes.from == null &&
-      pendingNumNodes.to == null
-    ) {
-      nodesState = { from: 1, to: maxNumNodes };
-    }
-  });
-
-  $effect(() => {
-    if (
-      $initialized &&
-      pendingNumHWThreads.from == null && 
-      pendingNumHWThreads.to == null 
-    ) {
-      threadState = { from: 1, to: maxNumHWThreads };
-    }
-  });
-
-  $effect(() => {
-    if (
-      $initialized &&
-      pendingNumAccelerators.from == null &&
-      pendingNumAccelerators.to == null
-    ) {
-      accState = { from: 0, to: maxNumAccelerators };
     }
   });
 
   /* Functions */
   function setResources() {
     if (nodesActive) {
-      pendingNumNodes = {...nodesState};
+      pendingNumNodes = {
+        from: (!nodesState?.from) ? 0 : nodesState.from,
+        to: (nodesState.to === null) ? 0 : nodesState.to
+      };
     } else {
-      pendingNumNodes = { from: null, to: null };
+      pendingNumNodes = { from: null, to: null};
     };
     if (threadActive) {
-      pendingNumHWThreads = {...threadState};
+      pendingNumHWThreads = {
+        from: (!threadState?.from) ? 0 : threadState.from,
+        to: (threadState.to === null) ? 0 : threadState.to
+      };
     } else {
-      pendingNumHWThreads = { from: null, to: null };
+      pendingNumHWThreads = { from: null, to: null};
     };
     if (accActive) {
-      pendingNumAccelerators = {...accState};
+      pendingNumAccelerators = {
+        from: (!accState?.from) ? 0 : accState.from,
+        to: (accState.to === null) ? 0 : accState.to
+      };
     } else {
-      pendingNumAccelerators = { from: null, to: null };
+      pendingNumAccelerators = { from: null, to: null};
     };
   };
 
@@ -195,13 +202,18 @@
     </div>
 
     <div class="mb-3">
-      <div class="mb-0"><b>Number of Nodes</b></div>
+      <div class="mb-0"><b>Number of Nodes</b> 
+        <Icon id="numnodes-info" style="cursor:help; padding-right: 10px;" size="sm" name="info-circle"/>
+      </div>
+      <Tooltip target={`numnodes-info`} placement="right">
+        Preset maximum is for whole cluster.
+      </Tooltip>
       <DoubleRangeSlider
         changeRange={(detail) => {
           nodesState.from = detail[0];
           nodesState.to = detail[1];
         }}
-        sliderMin={minNumNodes}
+        sliderMin={0}
         sliderMax={maxNumNodes}
         fromPreset={nodesState.from}
         toPreset={nodesState.to}
@@ -209,13 +221,19 @@
     </div>
 
     <div class="mb-3">
-      <div class="mb-0"><b>Number of HWThreads</b> (Use for Single-Node Jobs)</div>
+      <div class="mb-0">
+        <b>Number of HWThreads</b> 
+        <Icon id="numthreads-info" style="cursor:help; padding-right: 10px;" size="sm" name="info-circle"/>
+      </div>
+      <Tooltip target={`numthreads-info`} placement="right">
+        Presets for a single node. Use input fields to change to higher values.
+      </Tooltip>
       <DoubleRangeSlider
         changeRange={(detail) => {
           threadState.from = detail[0];
           threadState.to = detail[1];
         }}
-        sliderMin={1}
+        sliderMin={0}
         sliderMax={maxNumHWThreads}
         fromPreset={threadState.from}
         toPreset={threadState.to}
@@ -223,7 +241,13 @@
     </div>
     {#if maxNumAccelerators != null && maxNumAccelerators > 1}
       <div>
-        <div class="mb-0"><b>Number of Accelerators</b></div>
+        <div class="mb-0">
+          <b>Number of Accelerators</b> 
+          <Icon id="numaccs-info" style="cursor:help; padding-right: 10px;" size="sm" name="info-circle"/>
+        </div>
+        <Tooltip target={`numaccs-info`} placement="right">
+          Presets for a single node. Use input fields to change to higher values.
+        </Tooltip>
         <DoubleRangeSlider
           changeRange={(detail) => {
             accState.from = detail[0];
@@ -240,7 +264,6 @@
   <ModalFooter>
     <Button
       color="primary"
-      disabled={disableApply}
       onclick={() => {
         isOpen = false;
         setResources();

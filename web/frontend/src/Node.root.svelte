@@ -54,10 +54,16 @@
   const paging = { itemsPerPage: 50, page: 1 };
   const sorting = { field: "startTime", type: "col", order: "DESC" };
   const nodeMetricsQuery = gql`
-    query ($cluster: String!, $nodes: [String!], $from: Time!, $to: Time!) {
+    query (
+      $cluster: String!,
+      $nodes: [String!],
+      $from: Time!,
+      $to: Time!, 
+      $nodeFilter: [NodeFilter!]!,
+      $sorting: OrderByInput!
+    ) {
       nodeMetrics(cluster: $cluster, nodes: $nodes, from: $from, to: $to) {
         host
-        state
         subCluster
         metrics {
           name
@@ -78,7 +84,14 @@
             }
           }
         }
-      }
+      },
+      nodeStatus: nodes(filter: $nodeFilter, order: $sorting) {
+          count
+          items {
+            schedulerState
+            healthState
+          }
+        }
     }
   `;
   const nodeJobsQuery = gql`
@@ -92,7 +105,7 @@
       }
     }
   `;
-  // Node State Colors
+  // Node/Metric State Colors
   const stateColors = {
     allocated: 'success',
     reserved: 'info',
@@ -100,7 +113,10 @@
     mixed: 'warning',
     down: 'danger',
     unknown: 'dark',
-    notindb: 'secondary'
+    notindb: 'secondary',
+    full: 'success',
+    partial: 'warning',
+    failed: 'danger'
   }
 
   /* State Init */
@@ -119,8 +135,8 @@
 
   const filter = $derived([
     { cluster: { eq: cluster } },
-    { node: { eq: hostname } },
     { state: ["running"] },
+    { node: { eq: hostname } },
   ]);
 
   const systemUnits = $derived.by(() => {
@@ -142,6 +158,8 @@
         nodes: [hostname],
         from: from?.toISOString(),
         to: to?.toISOString(),
+        nodeFilter: { hostname: { eq: hostname }},
+        sorting // $sorting unused in backend: Use placeholder
       },
     })
   );
@@ -153,31 +171,46 @@
     })
   );
 
-  const thisNodeState = $derived($nodeMetricsData?.data?.nodeMetrics[0]?.state ? $nodeMetricsData.data.nodeMetrics[0].state : 'notindb');
+  const thisNodeState = $derived($nodeMetricsData?.data?.nodeStatus?.items[0]?.schedulerState || 'notindb');
+  const thisMetricHealth = $derived($nodeMetricsData?.data?.nodeStatus?.items[0]?.healthState || 'unknown');
 </script>
 
-<Row cols={{ xs: 2, lg: 5 }}>
+<Row cols={{ xs: 2, lg: 3}}>
   {#if $initq.error}
     <Card body color="danger">{$initq.error.message}</Card>
   {:else if $initq.fetching}
     <Spinner />
   {:else}
     <!-- Node Col -->
-    <Col>
+    <Col class="mb-2">
       <InputGroup>
         <InputGroupText><Icon name="hdd" /></InputGroupText>
         <InputGroupText>Selected Node</InputGroupText>
-        <Input style="background-color: white;" type="text" value="{hostname} [{cluster} {$nodeMetricsData?.data ? `(${$nodeMetricsData.data.nodeMetrics[0].subCluster})` : ''}]" disabled/>
+        <Input style="background-color: white;" type="text" value="{hostname} [{cluster} {$nodeMetricsData?.data?.nodeMetrics[0] ? `(${$nodeMetricsData.data.nodeMetrics[0].subCluster})` : ''}]" disabled/>
       </InputGroup>
     </Col>
-    <!-- State Col -->
-    <Col>
+    <!-- Node State Col -->
+    <Col class="mb-2">
       <InputGroup>
         <InputGroupText><Icon name="clipboard2-pulse" /></InputGroupText>
         <InputGroupText>Node State</InputGroupText>
         <Button class="flex-grow-1 text-center" color={stateColors[thisNodeState]} disabled>
           {#if $nodeMetricsData?.data}
-            {thisNodeState}
+            {thisNodeState.charAt(0).toUpperCase() + thisNodeState.slice(1)}
+          {:else}
+            <span><Spinner size="sm" secondary/></span>
+          {/if}
+        </Button>
+      </InputGroup>
+    </Col>
+    <!-- Metric Health Col -->
+    <Col class="mb-2">
+      <InputGroup>
+        <InputGroupText><Icon name="clipboard2-pulse" /></InputGroupText>
+        <InputGroupText>Metric Health</InputGroupText>
+        <Button class="flex-grow-1 text-center" color={stateColors[thisMetricHealth]} disabled>
+          {#if $nodeMetricsData?.data}
+            {thisMetricHealth.charAt(0).toUpperCase() + thisMetricHealth.slice(1)}
           {:else}
             <span><Spinner size="sm" secondary/></span>
           {/if}
@@ -185,7 +218,7 @@
       </InputGroup>
     </Col>
     <!-- Concurrent Col -->
-    <Col class="mt-2 mt-lg-0">
+    <Col>
       {#if $nodeJobsData.fetching}
         <Spinner />
       {:else if $nodeJobsData.data}
@@ -217,7 +250,7 @@
       />
     </Col>
     <!-- Refresh Col-->
-    <Col class="mt-2 mt-lg-0">
+    <Col>
       <Refresher
         onRefresh={() => {
           const diff = Date.now() - to;
@@ -259,7 +292,7 @@
             </CardHeader>
             <CardBody>
               <p>No dataset(s) returned for <b>{item.name}</b></p>
-              <p class="mb-1">Metric has been disabled for subcluster <b>{$nodeMetricsData.data.nodeMetrics[0].subCluster}</b>.</p>
+              <p class="mb-1">Metric has been disabled for subcluster <b>{$nodeMetricsData?.data?.nodeMetrics[0]?.subCluster}</b>.</p>
             </CardBody>
           </Card>
         {:else if item?.metric}
@@ -267,7 +300,7 @@
             metric={item.name}
             timestep={item.metric.timestep}
             cluster={clusterInfos.find((c) => c.name == cluster)}
-            subCluster={$nodeMetricsData.data.nodeMetrics[0].subCluster}
+            subCluster={$nodeMetricsData?.data?.nodeMetrics[0]?.subCluster}
             series={item.metric.series}
             enableFlip
             forNode
@@ -286,17 +319,17 @@
       {/snippet}
 
       <PlotGrid
-        items={$nodeMetricsData.data.nodeMetrics[0].metrics
+        items={$nodeMetricsData?.data?.nodeMetrics[0]?.metrics
           .map((m) => ({
             ...m,
             availability: checkMetricAvailability(
               globalMetrics,
               m.name,
               cluster,
-              $nodeMetricsData.data.nodeMetrics[0].subCluster,
+              $nodeMetricsData?.data?.nodeMetrics[0]?.subCluster,
             ),
           }))
-          .sort((a, b) => a.name.localeCompare(b.name))}
+          .sort((a, b) => a.name.localeCompare(b.name)) || []}
         itemsPerRow={ccconfig.plotConfiguration_plotsPerRow}
         {gridContent}
       />

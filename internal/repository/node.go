@@ -244,6 +244,77 @@ func (r *NodeRepository) UpdateNodeState(hostname string, cluster string, nodeSt
 	return nil
 }
 
+// NodeStateUpdate holds the data needed to update one node's state in a batch operation.
+type NodeStateUpdate struct {
+	Hostname  string
+	Cluster   string
+	NodeState *schema.NodeStateDB
+}
+
+// BatchUpdateNodeStates inserts node state rows for multiple nodes in a single transaction.
+// For each node, it looks up (or creates) the node row, then inserts the state row.
+// This reduces lock acquisitions from 2*N to 1 for N nodes.
+func (r *NodeRepository) BatchUpdateNodeStates(updates []NodeStateUpdate) error {
+	tx, err := r.DB.Beginx()
+	if err != nil {
+		return fmt.Errorf("BatchUpdateNodeStates: begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmtLookup, err := tx.Preparex("SELECT id FROM node WHERE hostname = ? AND cluster = ?")
+	if err != nil {
+		return fmt.Errorf("BatchUpdateNodeStates: prepare lookup: %w", err)
+	}
+	defer stmtLookup.Close()
+
+	stmtInsertNode, err := tx.PrepareNamed(NamedNodeInsert)
+	if err != nil {
+		return fmt.Errorf("BatchUpdateNodeStates: prepare node insert: %w", err)
+	}
+	defer stmtInsertNode.Close()
+
+	stmtInsertState, err := tx.PrepareNamed(NamedNodeStateInsert)
+	if err != nil {
+		return fmt.Errorf("BatchUpdateNodeStates: prepare state insert: %w", err)
+	}
+	defer stmtInsertState.Close()
+
+	for _, u := range updates {
+		var id int64
+		if err := stmtLookup.QueryRow(u.Hostname, u.Cluster).Scan(&id); err != nil {
+			if err == sql.ErrNoRows {
+				subcluster, scErr := archive.GetSubClusterByNode(u.Cluster, u.Hostname)
+				if scErr != nil {
+					cclog.Errorf("BatchUpdateNodeStates: subcluster lookup for '%s' in '%s': %v", u.Hostname, u.Cluster, scErr)
+					continue
+				}
+				node := schema.NodeDB{
+					Hostname: u.Hostname, Cluster: u.Cluster, SubCluster: subcluster,
+				}
+				res, insertErr := stmtInsertNode.Exec(&node)
+				if insertErr != nil {
+					cclog.Errorf("BatchUpdateNodeStates: insert node '%s': %v", u.Hostname, insertErr)
+					continue
+				}
+				id, _ = res.LastInsertId()
+			} else {
+				cclog.Errorf("BatchUpdateNodeStates: lookup node '%s': %v", u.Hostname, err)
+				continue
+			}
+		}
+
+		u.NodeState.NodeID = id
+		if _, err := stmtInsertState.Exec(u.NodeState); err != nil {
+			cclog.Errorf("BatchUpdateNodeStates: insert state for '%s': %v", u.Hostname, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("BatchUpdateNodeStates: commit: %w", err)
+	}
+	return nil
+}
+
 // func (r *NodeRepository) UpdateHealthState(hostname string, healthState *schema.MonitoringState) error {
 // 	if _, err := sq.Update("node").Set("health_state", healthState).Where("node.id = ?", id).RunWith(r.DB).Exec(); err != nil {
 // 		cclog.Errorf("error while updating node '%d'", id)
@@ -366,17 +437,21 @@ func (r *NodeRepository) QueryNodes(
 		cclog.Errorf("Error while running query '%s' %v: %v", queryString, queryVars, err)
 		return nil, err
 	}
+	defer rows.Close()
 
 	nodes := make([]*schema.Node, 0)
 	for rows.Next() {
 		node := schema.Node{}
 		if err := rows.Scan(&node.Hostname, &node.Cluster, &node.SubCluster,
 			&node.NodeState, &node.HealthState); err != nil {
-			rows.Close()
 			cclog.Warn("Error while scanning rows (QueryNodes)")
 			return nil, err
 		}
 		nodes = append(nodes, &node)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
 	return nodes, nil
@@ -415,6 +490,7 @@ func (r *NodeRepository) QueryNodesWithMeta(
 		cclog.Errorf("Error while running query '%s' %v: %v", queryString, queryVars, err)
 		return nil, err
 	}
+	defer rows.Close()
 
 	nodes := make([]*schema.Node, 0)
 	for rows.Next() {
@@ -424,7 +500,6 @@ func (r *NodeRepository) QueryNodesWithMeta(
 
 		if err := rows.Scan(&node.Hostname, &node.Cluster, &node.SubCluster,
 			&node.NodeState, &node.HealthState, &RawMetaData, &RawMetricHealth); err != nil {
-			rows.Close()
 			cclog.Warn("Error while scanning rows (QueryNodes)")
 			return nil, err
 		}
@@ -452,6 +527,10 @@ func (r *NodeRepository) QueryNodesWithMeta(
 		}
 
 		nodes = append(nodes, &node)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
 	return nodes, nil
@@ -514,8 +593,8 @@ func (r *NodeRepository) ListNodes(cluster string) ([]*schema.Node, error) {
 	return nodeList, nil
 }
 
-func (r *NodeRepository) MapNodes(cluster string) (map[string]string, error) {
-	q := sq.Select("node.hostname", "node_state.node_state").
+func (r *NodeRepository) MapNodes(cluster string) (map[string]string, map[string]string, error) {
+	q := sq.Select("node.hostname", "node_state.node_state", "node_state.health_state").
 		From("node").
 		Join("node_state ON node_state.node_id = node.id").
 		Where(latestStateCondition()).
@@ -525,30 +604,34 @@ func (r *NodeRepository) MapNodes(cluster string) (map[string]string, error) {
 	rows, err := q.RunWith(r.DB).Query()
 	if err != nil {
 		cclog.Warn("Error while querying node list")
-		return nil, err
+		return nil, nil, err
 	}
 
-	stateMap := make(map[string]string)
+	nodeStateMap := make(map[string]string)
+	metricHealthMap := make(map[string]string)
+
 	defer rows.Close()
 	for rows.Next() {
-		var hostname, nodestate string
-		if err := rows.Scan(&hostname, &nodestate); err != nil {
+		var hostname, nodeState, metricHealth string
+		if err := rows.Scan(&hostname, &nodeState, &metricHealth); err != nil {
 			cclog.Warn("Error while scanning node list (MapNodes)")
-			return nil, err
+			return nil, nil, err
 		}
 
-		stateMap[hostname] = nodestate
+		nodeStateMap[hostname] = nodeState
+		metricHealthMap[hostname] = metricHealth
 	}
 
-	return stateMap, nil
+	return nodeStateMap, metricHealthMap, nil
 }
 
 func (r *NodeRepository) CountStates(ctx context.Context, filters []*model.NodeFilter, column string) ([]*model.NodeStates, error) {
 	query, qerr := AccessCheck(ctx,
-		sq.Select(column).
+		sq.Select(column, "COUNT(*) as count").
 			From("node").
 			Join("node_state ON node_state.node_id = node.id").
-			Where(latestStateCondition()))
+			Where(latestStateCondition()).
+			GroupBy(column))
 	if qerr != nil {
 		return nil, qerr
 	}
@@ -561,23 +644,21 @@ func (r *NodeRepository) CountStates(ctx context.Context, filters []*model.NodeF
 		cclog.Errorf("Error while running query '%s' %v: %v", queryString, queryVars, err)
 		return nil, err
 	}
+	defer rows.Close()
 
-	stateMap := map[string]int{}
+	nodes := make([]*model.NodeStates, 0)
 	for rows.Next() {
 		var state string
-		if err := rows.Scan(&state); err != nil {
-			rows.Close()
+		var count int
+		if err := rows.Scan(&state, &count); err != nil {
 			cclog.Warn("Error while scanning rows (CountStates)")
 			return nil, err
 		}
-
-		stateMap[state] += 1
+		nodes = append(nodes, &model.NodeStates{State: state, Count: count})
 	}
 
-	nodes := make([]*model.NodeStates, 0)
-	for state, counts := range stateMap {
-		node := model.NodeStates{State: state, Count: counts}
-		nodes = append(nodes, &node)
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
 	return nodes, nil
@@ -623,6 +704,7 @@ func (r *NodeRepository) CountStatesTimed(ctx context.Context, filters []*model.
 		cclog.Errorf("Error while running query '%s' %v: %v", queryString, queryVars, err)
 		return nil, err
 	}
+	defer rows.Close()
 
 	rawData := make(map[string][][]int)
 	for rows.Next() {
@@ -630,7 +712,6 @@ func (r *NodeRepository) CountStatesTimed(ctx context.Context, filters []*model.
 		var timestamp, count int
 
 		if err := rows.Scan(&state, &timestamp, &count); err != nil {
-			rows.Close()
 			cclog.Warnf("Error while scanning rows (CountStatesTimed) at time '%d'", timestamp)
 			return nil, err
 		}
@@ -641,6 +722,10 @@ func (r *NodeRepository) CountStatesTimed(ctx context.Context, filters []*model.
 
 		rawData[state][0] = append(rawData[state][0], timestamp)
 		rawData[state][1] = append(rawData[state][1], count)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
 	timedStates := make([]*model.NodeStatesTimed, 0)
@@ -659,10 +744,11 @@ func (r *NodeRepository) GetNodesForList(
 	stateFilter string,
 	nodeFilter string,
 	page *model.PageRequest,
-) ([]string, map[string]string, int, bool, error) {
+) ([]string, map[string]string, map[string]string, int, bool, error) {
 	// Init Return Vars
 	nodes := make([]string, 0)
-	stateMap := make(map[string]string)
+	nodeStateMap := make(map[string]string)
+	metricHealthMap := make(map[string]string)
 	countNodes := 0
 	hasNextPage := false
 
@@ -696,7 +782,7 @@ func (r *NodeRepository) GetNodesForList(
 	rawNodes, serr := r.QueryNodes(ctx, queryFilters, page, nil) // Order not Used
 	if serr != nil {
 		cclog.Warn("error while loading node database data (Resolver.NodeMetricsList)")
-		return nil, nil, 0, false, serr
+		return nil, nil, nil, 0, false, serr
 	}
 
 	// Intermediate Node Result Info
@@ -705,7 +791,8 @@ func (r *NodeRepository) GetNodesForList(
 			continue
 		}
 		nodes = append(nodes, node.Hostname)
-		stateMap[node.Hostname] = string(node.NodeState)
+		nodeStateMap[node.Hostname] = string(node.NodeState)
+		metricHealthMap[node.Hostname] = string(node.HealthState)
 	}
 
 	// Special Case: Find Nodes not in DB node table but in metricStore only
@@ -765,7 +852,7 @@ func (r *NodeRepository) GetNodesForList(
 		countNodes, cerr = r.CountNodes(ctx, queryFilters)
 		if cerr != nil {
 			cclog.Warn("error while counting node database data (Resolver.NodeMetricsList)")
-			return nil, nil, 0, false, cerr
+			return nil, nil, nil, 0, false, cerr
 		}
 		hasNextPage = page.Page*page.ItemsPerPage < countNodes
 	}
@@ -775,7 +862,7 @@ func (r *NodeRepository) GetNodesForList(
 		nodes, countNodes, hasNextPage = getNodesFromTopol(cluster, subCluster, nodeFilter, page)
 	}
 
-	return nodes, stateMap, countNodes, hasNextPage, nil
+	return nodes, nodeStateMap, metricHealthMap, countNodes, hasNextPage, nil
 }
 
 func AccessCheck(ctx context.Context, query sq.SelectBuilder) (sq.SelectBuilder, error) {

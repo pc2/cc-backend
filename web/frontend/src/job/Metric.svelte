@@ -178,8 +178,6 @@
       timestep={selectedData.timestep}
       scope={selectedScope}
       metric={metricName}
-      numaccs={job.numAcc}
-      numhwthreads={job.numHWThreads}
       series={selectedSeries}
       {isShared}
       {zoomState}
@@ -194,14 +192,11 @@
       timestep={selectedData.timestep}
       scope={selectedScope}
       metric={metricName}
-      numaccs={job.numAcc}
-      numhwthreads={job.numHWThreads}
       series={selectedSeries}
       {isShared}
       {zoomState}
       {thresholdState}
       statisticsSeries={statsSeries[selectedScopeIndex]}
-      useStatsSeries={!!statsSeries[selectedScopeIndex]}
       enableFlip
     />
   {/if}

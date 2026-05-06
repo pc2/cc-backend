@@ -121,6 +121,14 @@ var configSchema = `
         "subject-node-state": {
           "description": "NATS subject for node state updates",
           "type": "string"
+        },
+        "job-concurrency": {
+          "description": "Number of concurrent worker goroutines for processing job events (default: 8).",
+          "type": "integer"
+        },
+        "node-concurrency": {
+          "description": "Number of concurrent worker goroutines for processing node state events (default: 2).",
+          "type": "integer"
         }
       },
       "required": ["subject-job-event", "subject-node-state"]
@@ -177,6 +185,36 @@ var configSchema = `
         }
       },
       "required": ["policy"]
+    },
+    "db-config": {
+      "description": "SQLite database tuning configuration.",
+      "type": "object",
+      "properties": {
+        "cache-size-mb": {
+          "description": "SQLite page cache size per connection in MB (default: 2048).",
+          "type": "integer"
+        },
+        "soft-heap-limit-mb": {
+          "description": "Process-wide SQLite soft heap limit in MB (default: 16384).",
+          "type": "integer"
+        },
+        "max-open-connections": {
+          "description": "Maximum number of open database connections (default: 4).",
+          "type": "integer"
+        },
+        "max-idle-connections": {
+          "description": "Maximum number of idle database connections (default: 4).",
+          "type": "integer"
+        },
+        "max-idle-time-minutes": {
+          "description": "Maximum idle time for a connection in minutes (default: 10).",
+          "type": "integer"
+        },
+        "busy-timeout-ms": {
+          "description": "SQLite busy timeout in milliseconds. When a write is blocked, SQLite retries with backoff for up to this duration before returning SQLITE_BUSY (default: 60000).",
+          "type": "integer"
+        }
+      }
     }
   }
 }`

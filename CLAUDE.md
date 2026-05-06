@@ -151,9 +151,11 @@ applied automatically on startup. Version tracking in `version` table.
 ## Configuration
 
 - **config.json**: Main configuration (clusters, metric repositories, archive settings)
-  - `main.apiSubjects`: NATS subject configuration (optional)
-    - `subjectJobEvent`: Subject for job start/stop events (e.g., "cc.job.event")
-    - `subjectNodeState`: Subject for node state updates (e.g., "cc.node.state")
+  - `main.api-subjects`: NATS subject configuration (optional)
+    - `subject-job-event`: Subject for job start/stop events (e.g., "cc.job.event")
+    - `subject-node-state`: Subject for node state updates (e.g., "cc.node.state")
+    - `job-concurrency`: Worker goroutines for job events (default: 8)
+    - `node-concurrency`: Worker goroutines for node state events (default: 2)
   - `nats`: NATS client connection configuration (optional)
     - `address`: NATS server address (e.g., "nats://localhost:4222")
     - `username`: Authentication username (optional)
@@ -227,6 +229,7 @@ The backend supports a NATS-based API as an alternative to the REST API for job 
 ### Setup
 
 1. Configure NATS client connection in `config.json`:
+
    ```json
    {
      "nats": {
@@ -238,16 +241,24 @@ The backend supports a NATS-based API as an alternative to the REST API for job 
    ```
 
 2. Configure API subjects in `config.json` under `main`:
+
    ```json
    {
      "main": {
-       "apiSubjects": {
-         "subjectJobEvent": "cc.job.event",
-         "subjectNodeState": "cc.node.state"
+       "api-subjects": {
+         "subject-job-event": "cc.job.event",
+         "subject-node-state": "cc.node.state",
+         "job-concurrency": 8,
+         "node-concurrency": 2
        }
      }
    }
    ```
+
+   - `subject-job-event` (required): NATS subject for job start/stop events
+   - `subject-node-state` (required): NATS subject for node state updates
+   - `job-concurrency` (optional, default: 8): Number of concurrent worker goroutines for job events
+   - `node-concurrency` (optional, default: 2): Number of concurrent worker goroutines for node state events
 
 ### Message Format
 
@@ -256,19 +267,23 @@ Messages use **InfluxDB line protocol** format with the following structure:
 #### Job Events
 
 **Start Job:**
+
 ```
 job,function=start_job event="{\"jobId\":123,\"user\":\"alice\",\"cluster\":\"test\", ...}" 1234567890000000000
 ```
 
 **Stop Job:**
+
 ```
 job,function=stop_job event="{\"jobId\":123,\"cluster\":\"test\",\"startTime\":1234567890,\"stopTime\":1234571490,\"jobState\":\"completed\"}" 1234571490000000000
 ```
 
 **Tags:**
+
 - `function`: Either `start_job` or `stop_job`
 
 **Fields:**
+
 - `event`: JSON payload containing job data (see REST API documentation for schema)
 
 #### Node State Updates
@@ -292,15 +307,38 @@ job,function=stop_job event="{\"jobId\":123,\"cluster\":\"test\",\"startTime\":1
 ### Implementation Notes
 
 - NATS API mirrors REST API functionality but uses messaging
-- Job start/stop events are processed asynchronously
+- Job start/stop events are processed asynchronously via configurable worker pools
 - Duplicate job detection is handled (same as REST API)
 - All validation rules from REST API apply
+- Node state updates include health checks against the metric store (identical to REST handler): nodes are grouped by subcluster, metric configurations are fetched, and `HealthCheck()` is called per subcluster. Nodes default to `MonitoringStateFailed` if no health data is available.
 - Messages are logged; no responses are sent back to publishers
 - If NATS client is unavailable, API subscriptions are skipped (logged as warning)
 
+## Development Guidelines
+
+### Performance
+
+This application processes large volumes of HPC monitoring data (metrics, job
+records, archives) at scale. All code changes must prioritize maximum throughput
+and minimal latency. Avoid unnecessary allocations, prefer streaming over
+buffering, and be mindful of lock contention. When in doubt, benchmark.
+
+### Change Impact Analysis
+
+For any significant change, you MUST:
+
+1. **Check all call paths**: Trace every caller of modified functions to ensure
+   correctness is preserved throughout the call chain.
+2. **Evaluate side effects**: Identify and verify all side effects — database
+   writes, cache invalidations, channel sends, goroutine lifecycle changes, file
+   I/O, and external API calls.
+3. **Consider concurrency implications**: This codebase uses goroutines and
+   channels extensively. Verify that changes do not introduce races, deadlocks,
+   or contention bottlenecks.
+
 ## Dependencies
 
-- Go 1.24.0+ (check go.mod for exact version)
+- Go 1.25.0+ (check go.mod for exact version)
 - Node.js (for frontend builds)
 - SQLite 3 (only supported database)
 - Optional: NATS server for NATS API integration

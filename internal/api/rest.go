@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -184,7 +185,8 @@ type DefaultAPIResponse struct {
 // handleError writes a standardized JSON error response with the given status code.
 // It logs the error at WARN level and ensures proper Content-Type headers are set.
 func handleError(err error, statusCode int, rw http.ResponseWriter) {
-	cclog.Warnf("REST ERROR : %s", err.Error())
+	_, file, line, _ := runtime.Caller(1)
+	cclog.Warnf("REST ERROR (%s:%d): %s", filepath.Base(file), line, err.Error())
 	rw.Header().Add("Content-Type", "application/json")
 	rw.WriteHeader(statusCode)
 	if err := json.NewEncoder(rw).Encode(ErrorResponse{
@@ -302,7 +304,7 @@ func (api *RestAPI) runTagger(rw http.ResponseWriter, r *http.Request) {
 
 	rw.Header().Set("Content-Type", "text/plain")
 	rw.WriteHeader(http.StatusOK)
-	if _, err := rw.Write([]byte(fmt.Sprintf("Tagger %s started", name))); err != nil {
+	if _, err := rw.Write(fmt.Appendf(nil, "Tagger %s started", name)); err != nil {
 		cclog.Errorf("Failed to write response: %v", err)
 	}
 }

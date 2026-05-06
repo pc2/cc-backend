@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	goruntime "runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -108,6 +109,29 @@ func initConfiguration() error {
 }
 
 func initDatabase() error {
+	if config.Keys.DbConfig != nil {
+		cfg := repository.DefaultConfig()
+		dc := config.Keys.DbConfig
+		if dc.CacheSizeMB > 0 {
+			cfg.DbCacheSizeMB = dc.CacheSizeMB
+		}
+		if dc.SoftHeapLimitMB > 0 {
+			cfg.DbSoftHeapLimitMB = dc.SoftHeapLimitMB
+		}
+		if dc.MaxOpenConnections > 0 {
+			cfg.MaxOpenConnections = dc.MaxOpenConnections
+		}
+		if dc.MaxIdleConnections > 0 {
+			cfg.MaxIdleConnections = dc.MaxIdleConnections
+		}
+		if dc.ConnectionMaxIdleTimeMins > 0 {
+			cfg.ConnectionMaxIdleTime = time.Duration(dc.ConnectionMaxIdleTimeMins) * time.Minute
+		}
+		if dc.BusyTimeoutMs > 0 {
+			cfg.BusyTimeoutMs = dc.BusyTimeoutMs
+		}
+		repository.SetConfig(cfg)
+	}
 	repository.Connect(config.Keys.DB)
 	return nil
 }
@@ -339,7 +363,7 @@ func runServer(ctx context.Context) error {
 		err := metricdispatch.Init(mscfg)
 
 		if err != nil {
-			cclog.Debugf("initializing metricdispatch: %v", err)
+			cclog.Debugf("error while initializing external metricdispatch: %v", err)
 		} else {
 			haveMetricstore = true
 		}
@@ -395,6 +419,7 @@ func runServer(ctx context.Context) error {
 
 	// Set GC percent if not configured
 	if os.Getenv(envGOGC) == "" {
+		// trigger GC when heap grows 15% above the previous live set
 		debug.SetGCPercent(15)
 	}
 	runtime.SystemdNotify(true, "running")
@@ -488,6 +513,20 @@ func run() error {
 		return err
 	}
 
+	// Optimize database if requested
+	if flagOptimizeDB {
+		db := repository.GetConnection()
+		cclog.Print("Running VACUUM to reclaim space and defragment database...")
+		if _, err := db.DB.Exec("VACUUM"); err != nil {
+			return fmt.Errorf("VACUUM failed: %w", err)
+		}
+		cclog.Print("Running ANALYZE to update query planner statistics...")
+		if _, err := db.DB.Exec("ANALYZE"); err != nil {
+			return fmt.Errorf("ANALYZE failed: %w", err)
+		}
+		cclog.Exitf("OptimizeDB Success: Database '%s' optimized (VACUUM + ANALYZE).\n", config.Keys.DB)
+	}
+
 	// Handle user commands (add, delete, sync, JWT)
 	if err := handleUserCommands(); err != nil {
 		return err
@@ -496,6 +535,43 @@ func run() error {
 	// Initialize subsystems (archive, metrics, taggers)
 	if err := initSubsystems(); err != nil {
 		return err
+	}
+
+	// Handle checkpoint cleanup
+	if flagCleanupCheckpoints {
+		mscfg := ccconf.GetPackageConfig("metric-store")
+		if mscfg == nil {
+			return fmt.Errorf("metric-store configuration required for checkpoint cleanup")
+		}
+		if err := json.Unmarshal(mscfg, &metricstore.Keys); err != nil {
+			return fmt.Errorf("decoding metric-store config: %w", err)
+		}
+		if metricstore.Keys.NumWorkers <= 0 {
+			metricstore.Keys.NumWorkers = min(goruntime.NumCPU()/2+1, metricstore.DefaultMaxWorkers)
+		}
+
+		d, err := time.ParseDuration(metricstore.Keys.RetentionInMemory)
+		if err != nil {
+			return fmt.Errorf("parsing retention-in-memory: %w", err)
+		}
+		from := time.Now().Add(-d)
+		deleteMode := metricstore.Keys.Cleanup == nil || metricstore.Keys.Cleanup.Mode != "archive"
+		cleanupDir := ""
+		if !deleteMode {
+			cleanupDir = metricstore.Keys.Cleanup.RootDir
+		}
+
+		cclog.Infof("Cleaning up checkpoints older than %s...", from.Format(time.RFC3339))
+		n, err := metricstore.CleanupCheckpoints(
+			metricstore.Keys.Checkpoints.RootDir, cleanupDir, from.Unix(), deleteMode)
+		if err != nil {
+			return fmt.Errorf("checkpoint cleanup: %w", err)
+		}
+		if deleteMode {
+			cclog.Exitf("Cleanup done: %d checkpoint files deleted.", n)
+		} else {
+			cclog.Exitf("Cleanup done: %d checkpoint files archived to parquet.", n)
+		}
 	}
 
 	// Exit if start server is not requested

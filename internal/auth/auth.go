@@ -164,12 +164,17 @@ func (auth *Authentication) AuthViaSession(
 		return nil, errors.New("invalid session data")
 	}
 
+	authSourceInt, ok := session.Values["authSource"].(int)
+	if !ok {
+		authSourceInt = int(schema.AuthViaLocalPassword)
+	}
+
 	return &schema.User{
 		Username:   username,
 		Projects:   projects,
 		Roles:      roles,
 		AuthType:   schema.AuthSession,
-		AuthSource: -1,
+		AuthSource: schema.AuthSource(authSourceInt),
 	}, nil
 }
 
@@ -263,7 +268,7 @@ func GetAuthInstance() *Authentication {
 }
 
 // handleUserSync syncs or updates a user in the database based on configuration.
-// This is used for both JWT and OIDC authentication when syncUserOnLogin or updateUserOnLogin is enabled.
+// This is used for LDAP, JWT and OIDC authentications when syncUserOnLogin or updateUserOnLogin is enabled.
 func handleUserSync(user *schema.User, syncUserOnLogin, updateUserOnLogin bool) {
 	r := repository.GetUserRepository()
 	dbUser, err := r.GetUser(user.Username)
@@ -319,10 +324,11 @@ func (auth *Authentication) SaveSession(rw http.ResponseWriter, r *http.Request,
 		}
 		session.Options.Secure = false
 	}
-	session.Options.SameSite = http.SameSiteStrictMode
+	session.Options.SameSite = http.SameSiteLaxMode
 	session.Values["username"] = user.Username
 	session.Values["projects"] = user.Projects
 	session.Values["roles"] = user.Roles
+	session.Values["authSource"] = int(user.AuthSource)
 	if err := auth.sessionStore.Save(r, rw, session); err != nil {
 		cclog.Warnf("session save failed: %s", err.Error())
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
@@ -421,7 +427,7 @@ func (auth *Authentication) Auth(
 			return
 		}
 
-		cclog.Info("auth -> authentication failed")
+		cclog.Infof("auth -> authentication failed: no valid session or JWT for %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
 		onfailure(rw, r, errors.New("unauthorized (please login first)"))
 	})
 }

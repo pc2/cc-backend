@@ -3,17 +3,21 @@
 // Use of this source code is governed by a MIT-style
 // license that can be found in the LICENSE file.
 
+// This file implements the cleanup (archiving or deletion) of old checkpoint files.
+//
+// The CleanUp worker runs on a timer equal to RetentionInMemory. In "archive" mode
+// it converts checkpoint files older than the retention window into per-cluster
+// Parquet files and then deletes the originals. In "delete" mode it simply removes
+// old checkpoint files.
 package metricstore
 
 import (
-	"archive/zip"
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,25 +25,26 @@ import (
 	cclog "github.com/ClusterCockpit/cc-lib/v2/ccLogger"
 )
 
-// Worker for either Archiving or Deleting files
-
+// CleanUp starts a background worker that periodically removes or archives
+// checkpoint files older than the configured retention window.
+//
+// In "archive" mode, old checkpoint files are converted to Parquet and stored
+// under Keys.Cleanup.RootDir. In "delete" mode they are simply removed.
+// The cleanup interval equals Keys.RetentionInMemory.
 func CleanUp(wg *sync.WaitGroup, ctx context.Context) {
 	if Keys.Cleanup.Mode == "archive" {
+		cclog.Info("[METRICSTORE]> enable archive cleanup to parquet")
 		// Run as Archiver
 		cleanUpWorker(wg, ctx,
-			Keys.Cleanup.Interval,
+			Keys.RetentionInMemory,
 			"archiving",
 			Keys.Cleanup.RootDir,
 			false,
 		)
 	} else {
-		if Keys.Cleanup.Interval == "" {
-			Keys.Cleanup.Interval = Keys.RetentionInMemory
-		}
-
 		// Run as Deleter
 		cleanUpWorker(wg, ctx,
-			Keys.Cleanup.Interval,
+			Keys.RetentionInMemory,
 			"deleting",
 			"",
 			true,
@@ -47,12 +52,9 @@ func CleanUp(wg *sync.WaitGroup, ctx context.Context) {
 	}
 }
 
-// runWorker takes simple values to configure what it does
+// cleanUpWorker takes simple values to configure what it does
 func cleanUpWorker(wg *sync.WaitGroup, ctx context.Context, interval string, mode string, cleanupDir string, delete bool) {
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
+	wg.Go(func() {
 		d, err := time.ParseDuration(interval)
 		if err != nil {
 			cclog.Fatalf("[METRICSTORE]> error parsing %s interval duration: %v\n", mode, err)
@@ -77,29 +79,38 @@ func cleanUpWorker(wg *sync.WaitGroup, ctx context.Context, interval string, mod
 				if err != nil {
 					cclog.Errorf("[METRICSTORE]> %s failed: %s", mode, err.Error())
 				} else {
-					if delete && cleanupDir == "" {
+					if delete {
 						cclog.Infof("[METRICSTORE]> done: %d checkpoints deleted", n)
 					} else {
-						cclog.Infof("[METRICSTORE]> done: %d files zipped and moved to archive", n)
+						cclog.Infof("[METRICSTORE]> done: %d checkpoint files archived to parquet", n)
 					}
 				}
 			}
 		}
-	}()
+	})
 }
 
 var ErrNoNewArchiveData error = errors.New("all data already archived")
 
-// Delete or ZIP all checkpoint files older than `from` together and write them to the `cleanupDir`,
-// deleting/moving them from the `checkpointsDir`.
+// CleanupCheckpoints deletes or archives all checkpoint files older than `from`.
+// When archiving, consolidates all hosts per cluster into a single Parquet file.
 func CleanupCheckpoints(checkpointsDir, cleanupDir string, from int64, deleteInstead bool) (int, error) {
+	if deleteInstead {
+		return deleteCheckpoints(checkpointsDir, from)
+	}
+
+	return archiveCheckpoints(checkpointsDir, cleanupDir, from)
+}
+
+// deleteCheckpoints removes checkpoint files older than `from` across all clusters/hosts.
+func deleteCheckpoints(checkpointsDir string, from int64) (int, error) {
 	entries1, err := os.ReadDir(checkpointsDir)
 	if err != nil {
 		return 0, err
 	}
 
 	type workItem struct {
-		cdir, adir    string
+		dir           string
 		cluster, host string
 	}
 
@@ -111,13 +122,29 @@ func CleanupCheckpoints(checkpointsDir, cleanupDir string, from int64, deleteIns
 	for worker := 0; worker < Keys.NumWorkers; worker++ {
 		go func() {
 			defer wg.Done()
-			for workItem := range work {
-				m, err := cleanupCheckpoints(workItem.cdir, workItem.adir, from, deleteInstead)
+			for item := range work {
+				entries, err := os.ReadDir(item.dir)
 				if err != nil {
-					cclog.Errorf("error while archiving %s/%s: %s", workItem.cluster, workItem.host, err.Error())
+					cclog.Errorf("error reading %s/%s: %s", item.cluster, item.host, err.Error())
 					atomic.AddInt32(&errs, 1)
+					continue
 				}
-				atomic.AddInt32(&n, int32(m))
+
+				files, err := findFiles(entries, from, false)
+				if err != nil {
+					cclog.Errorf("error finding files in %s/%s: %s", item.cluster, item.host, err.Error())
+					atomic.AddInt32(&errs, 1)
+					continue
+				}
+
+				for _, checkpoint := range files {
+					if err := os.Remove(filepath.Join(item.dir, checkpoint)); err != nil {
+						cclog.Errorf("error deleting %s/%s/%s: %s", item.cluster, item.host, checkpoint, err.Error())
+						atomic.AddInt32(&errs, 1)
+					} else {
+						atomic.AddInt32(&n, 1)
+					}
+				}
 			}
 		}()
 	}
@@ -126,14 +153,14 @@ func CleanupCheckpoints(checkpointsDir, cleanupDir string, from int64, deleteIns
 		entries2, e := os.ReadDir(filepath.Join(checkpointsDir, de1.Name()))
 		if e != nil {
 			err = e
+			continue
 		}
 
 		for _, de2 := range entries2 {
-			cdir := filepath.Join(checkpointsDir, de1.Name(), de2.Name())
-			adir := filepath.Join(cleanupDir, de1.Name(), de2.Name())
 			work <- workItem{
-				adir: adir, cdir: cdir,
-				cluster: de1.Name(), host: de2.Name(),
+				dir:     filepath.Join(checkpointsDir, de1.Name(), de2.Name()),
+				cluster: de1.Name(),
+				host:    de2.Name(),
 			}
 		}
 	}
@@ -144,85 +171,182 @@ func CleanupCheckpoints(checkpointsDir, cleanupDir string, from int64, deleteIns
 	if err != nil {
 		return int(n), err
 	}
-
 	if errs > 0 {
-		return int(n), fmt.Errorf("%d errors happened while archiving (%d successes)", errs, n)
+		return int(n), fmt.Errorf("%d errors happened while deleting (%d successes)", errs, n)
 	}
 	return int(n), nil
 }
 
-// Helper function for `CleanupCheckpoints`.
-func cleanupCheckpoints(dir string, cleanupDir string, from int64, deleteInstead bool) (int, error) {
-	entries, err := os.ReadDir(dir)
+// archiveCheckpoints archives checkpoint files to Parquet format.
+// Produces one Parquet file per cluster: <cleanupDir>/<cluster>/<timestamp>.parquet
+// Workers load checkpoint files from disk and send CheckpointFile trees on a
+// back-pressured channel. The main thread streams each tree directly to Parquet
+// rows without materializing all rows in memory.
+func archiveCheckpoints(checkpointsDir, cleanupDir string, from int64) (int, error) {
+	cclog.Info("[METRICSTORE]> start archiving checkpoints to parquet")
+	startTime := time.Now()
+
+	clusterEntries, err := os.ReadDir(checkpointsDir)
 	if err != nil {
 		return 0, err
 	}
 
-	files, err := findFiles(entries, from, false)
-	if err != nil {
-		return 0, err
-	}
+	totalFiles := 0
+	var clusterErrors []string
 
-	if deleteInstead {
-		n := 0
-		for _, checkpoint := range files {
-			filename := filepath.Join(dir, checkpoint)
-			if err = os.Remove(filename); err != nil {
-				return n, err
-			}
-			n += 1
+	for _, clusterEntry := range clusterEntries {
+		if !clusterEntry.IsDir() {
+			continue
 		}
-		return n, nil
-	}
 
-	filename := filepath.Join(cleanupDir, fmt.Sprintf("%d.zip", from))
-	f, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY, CheckpointFilePerms)
-	if err != nil && os.IsNotExist(err) {
-		err = os.MkdirAll(cleanupDir, CheckpointDirPerms)
-		if err == nil {
-			f, err = os.OpenFile(filename, os.O_CREATE|os.O_WRONLY, CheckpointFilePerms)
-		}
-	}
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-	bw := bufio.NewWriter(f)
-	defer bw.Flush()
-	zw := zip.NewWriter(bw)
-	defer zw.Close()
-
-	n := 0
-	for _, checkpoint := range files {
-		// Use closure to ensure file is closed immediately after use,
-		// avoiding file descriptor leak from defer in loop
-		err := func() error {
-			filename := filepath.Join(dir, checkpoint)
-			r, err := os.Open(filename)
-			if err != nil {
-				return err
-			}
-			defer r.Close()
-
-			w, err := zw.Create(checkpoint)
-			if err != nil {
-				return err
-			}
-
-			if _, err = io.Copy(w, r); err != nil {
-				return err
-			}
-
-			if err = os.Remove(filename); err != nil {
-				return err
-			}
-			return nil
-		}()
+		cluster := clusterEntry.Name()
+		hostEntries, err := os.ReadDir(filepath.Join(checkpointsDir, cluster))
 		if err != nil {
-			return n, err
+			cclog.Errorf("[METRICSTORE]> error reading host entries for cluster %s: %s", cluster, err.Error())
+			clusterErrors = append(clusterErrors, cluster)
+			continue
 		}
-		n += 1
+
+		// Workers load checkpoint files from disk; main thread writes to parquet.
+		type hostResult struct {
+			checkpoints []*CheckpointFile
+			hostname    string
+			files       []string // checkpoint filenames to delete after successful write
+			dir         string   // checkpoint directory for this host
+		}
+
+		// Small buffer provides back-pressure: at most NumWorkers+2 results in flight.
+		results := make(chan hostResult, 2)
+		work := make(chan struct {
+			dir, host string
+		}, Keys.NumWorkers)
+
+		var wg sync.WaitGroup
+		errs := int32(0)
+
+		wg.Add(Keys.NumWorkers)
+		for w := 0; w < Keys.NumWorkers; w++ {
+			go func() {
+				defer wg.Done()
+				for item := range work {
+					checkpoints, files, err := loadCheckpointFiles(item.dir, from)
+					if err != nil {
+						cclog.Errorf("[METRICSTORE]> error reading checkpoints for %s/%s: %s", cluster, item.host, err.Error())
+						atomic.AddInt32(&errs, 1)
+						continue
+					}
+					if len(checkpoints) > 0 {
+						results <- hostResult{
+							checkpoints: checkpoints,
+							hostname:    item.host,
+							files:       files,
+							dir:         item.dir,
+						}
+					}
+				}
+			}()
+		}
+
+		go func() {
+			for _, hostEntry := range hostEntries {
+				if !hostEntry.IsDir() {
+					continue
+				}
+				dir := filepath.Join(checkpointsDir, cluster, hostEntry.Name())
+				work <- struct {
+					dir, host string
+				}{dir: dir, host: hostEntry.Name()}
+			}
+			close(work)
+			wg.Wait()
+			close(results)
+		}()
+
+		// Open streaming writer and write each host's checkpoint files as a row group
+		parquetFile := filepath.Join(cleanupDir, cluster, fmt.Sprintf("%d.parquet", from))
+		writer, err := newParquetArchiveWriter(parquetFile)
+		if err != nil {
+			// Drain results channel to unblock workers
+			for range results {
+			}
+			cclog.Errorf("[METRICSTORE]> error creating parquet writer for cluster %s: %s", cluster, err.Error())
+			clusterErrors = append(clusterErrors, cluster)
+			continue
+		}
+
+		type deleteItem struct {
+			dir   string
+			files []string
+		}
+		var toDelete []deleteItem
+		writeErr := error(nil)
+
+		for r := range results {
+			if writeErr == nil {
+				// Stream each checkpoint file directly to parquet rows.
+				// Each checkpoint is processed and discarded before the next.
+				for _, cf := range r.checkpoints {
+					if err := writer.WriteCheckpointFile(cf, cluster, r.hostname, "node", ""); err != nil {
+						writeErr = err
+						break
+					}
+				}
+				// Flush once per host to keep row group count within parquet limits.
+				if writeErr == nil {
+					if err := writer.FlushRowGroup(); err != nil {
+						writeErr = err
+					}
+				}
+			}
+			// Always track files for deletion (even if write failed, we still drain)
+			toDelete = append(toDelete, deleteItem{dir: r.dir, files: r.files})
+		}
+
+		if err := writer.Close(); err != nil && writeErr == nil {
+			writeErr = err
+		}
+
+		if errs > 0 {
+			cclog.Errorf("[METRICSTORE]> %d errors reading checkpoints for cluster %s", errs, cluster)
+			clusterErrors = append(clusterErrors, cluster)
+			os.Remove(parquetFile)
+			continue
+		}
+
+		if writer.count == 0 {
+			// No data written — remove empty file
+			os.Remove(parquetFile)
+			continue
+		}
+
+		if writeErr != nil {
+			os.Remove(parquetFile)
+			cclog.Errorf("[METRICSTORE]> error writing parquet archive for cluster %s: %s", cluster, writeErr.Error())
+			clusterErrors = append(clusterErrors, cluster)
+			continue
+		}
+
+		// Delete archived checkpoint files
+		for _, item := range toDelete {
+			for _, file := range item.files {
+				filename := filepath.Join(item.dir, file)
+				if err := os.Remove(filename); err != nil {
+					cclog.Warnf("[METRICSTORE]> could not remove archived checkpoint %s: %v", filename, err)
+				} else {
+					totalFiles++
+				}
+			}
+		}
+
+		cclog.Infof("[METRICSTORE]> archived %d rows from %d files for cluster %s to %s",
+			writer.count, totalFiles, cluster, parquetFile)
 	}
 
-	return n, nil
+	cclog.Infof("[METRICSTORE]> archiving checkpoints completed in %s (%d files)", time.Since(startTime).Round(time.Millisecond), totalFiles)
+
+	if len(clusterErrors) > 0 {
+		return totalFiles, fmt.Errorf("archiving failed for clusters: %s", strings.Join(clusterErrors, ", "))
+	}
+
+	return totalFiles, nil
 }

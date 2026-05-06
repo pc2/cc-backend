@@ -11,15 +11,13 @@
 //
 //	MetricStoreConfig (Keys)
 //	├─ NumWorkers: Parallel checkpoint/archive workers
-//	├─ RetentionInMemory: How long to keep data in RAM
+//	├─ RetentionInMemory: How long to keep data in RAM (also used as cleanup interval)
 //	├─ MemoryCap: Memory limit in bytes (triggers forceFree)
 //	├─ Checkpoints: Persistence configuration
-//	│  ├─ FileFormat: "avro" or "json"
-//	│  ├─ Interval: How often to save (e.g., "1h")
+//	│  ├─ FileFormat: "json" or "wal" (default: "wal")
 //	│  └─ RootDir: Checkpoint storage path
-//	├─ Cleanup: Long-term storage configuration
-//	│  ├─ Interval: How often to delete/archive
-//	│  ├─ RootDir: Archive storage path
+//	├─ Cleanup: Long-term storage configuration (interval = RetentionInMemory)
+//	│  ├─ RootDir: Archive storage path (archive mode only)
 //	│  └─ Mode: "delete" or "archive"
 //	├─ Debug: Development/debugging options
 //	└─ Subscriptions: NATS topic subscriptions for metric ingestion
@@ -55,22 +53,20 @@ const (
 	DefaultMaxWorkers                 = 10
 	DefaultBufferCapacity             = 512
 	DefaultGCTriggerInterval          = 100
-	DefaultAvroWorkers                = 4
-	DefaultCheckpointBufferMin        = 3
-	DefaultAvroCheckpointInterval     = time.Minute
-	DefaultMemoryUsageTrackerInterval = 1 * time.Hour
+	DefaultMemoryUsageTrackerInterval = 5 * time.Minute
 )
 
 // Checkpoints configures periodic persistence of in-memory metric data.
 //
 // Fields:
-//   - FileFormat: "avro" (default, binary, compact) or "json" (human-readable, slower)
-//   - Interval:   Duration string (e.g., "1h", "30m") between checkpoint saves
-//   - RootDir:    Filesystem path for checkpoint files (created if missing)
+//   - FileFormat:  "json" (human-readable, periodic) or "wal" (binary snapshot + WAL, crash-safe); default is "wal"
+//   - RootDir:     Filesystem path for checkpoint files (created if missing)
+//   - MaxWALSize:  Maximum size in bytes for a single host's WAL file; 0 = unlimited (default).
+//     When exceeded the WAL is force-rotated to prevent unbounded disk growth.
 type Checkpoints struct {
 	FileFormat string `json:"file-format"`
-	Interval   string `json:"interval"`
 	RootDir    string `json:"directory"`
+	MaxWALSize int64  `json:"max-wal-size,omitempty"`
 }
 
 // Debug provides development and profiling options.
@@ -83,18 +79,17 @@ type Debug struct {
 	EnableGops bool   `json:"gops"`
 }
 
-// Archive configures long-term storage of old metric data.
+// Cleanup configures long-term storage of old metric data.
 //
 // Data older than RetentionInMemory is archived to disk or deleted.
+// The cleanup interval is always RetentionInMemory.
 //
 // Fields:
-//   - ArchiveInterval: Duration string (e.g., "24h") between archive operations
-//   - RootDir:         Filesystem path for archived data (created if missing)
-//   - DeleteInstead:   If true, delete old data instead of archiving (saves disk space)
+//   - RootDir: Filesystem path for archived data (used in "archive" mode)
+//   - Mode:    "delete" (discard old data) or "archive" (write to RootDir)
 type Cleanup struct {
-	Interval string `json:"interval"`
-	RootDir  string `json:"directory"`
-	Mode     string `json:"mode"`
+	RootDir string `json:"directory"`
+	Mode    string `json:"mode"`
 }
 
 // Subscriptions defines NATS topics to subscribe to for metric ingestion.
@@ -121,7 +116,7 @@ type Subscriptions []struct {
 // Fields:
 //   - NumWorkers:        Parallel workers for checkpoint/archive (0 = auto: min(NumCPU/2+1, 10))
 //   - RetentionInMemory: Duration string (e.g., "48h") for in-memory data retention
-//   - MemoryCap:         Max bytes for buffer data (0 = unlimited); triggers forceFree when exceeded
+//   - MemoryCap:         Max memory in GB for buffer data (0 = unlimited); triggers forceFree when exceeded
 //   - Checkpoints:       Periodic persistence configuration
 //   - Debug:             Development/profiling options (nil = disabled)
 //   - Archive:           Long-term storage configuration (nil = disabled)
@@ -129,13 +124,14 @@ type Subscriptions []struct {
 type MetricStoreConfig struct {
 	// Number of concurrent workers for checkpoint and archive operations.
 	// If not set or 0, defaults to min(runtime.NumCPU()/2+1, 10)
-	NumWorkers        int            `json:"num-workers"`
-	RetentionInMemory string         `json:"retention-in-memory"`
-	MemoryCap         int            `json:"memory-cap"`
-	Checkpoints       Checkpoints    `json:"checkpoints"`
-	Debug             *Debug         `json:"debug"`
-	Cleanup           *Cleanup       `json:"cleanup"`
-	Subscriptions     *Subscriptions `json:"nats-subscriptions"`
+	NumWorkers         int            `json:"num-workers"`
+	RetentionInMemory  string         `json:"retention-in-memory"`
+	CheckpointInterval string         `json:"checkpoint-interval,omitempty"`
+	MemoryCap          int            `json:"memory-cap"`
+	Checkpoints        Checkpoints    `json:"checkpoints"`
+	Debug              *Debug         `json:"debug"`
+	Cleanup            *Cleanup       `json:"cleanup"`
+	Subscriptions      *Subscriptions `json:"nats-subscriptions"`
 }
 
 // Keys is the global metricstore configuration instance.
@@ -144,7 +140,7 @@ type MetricStoreConfig struct {
 // Accessed by Init(), Checkpointing(), and other lifecycle functions.
 var Keys MetricStoreConfig = MetricStoreConfig{
 	Checkpoints: Checkpoints{
-		FileFormat: "avro",
+		FileFormat: "wal",
 		RootDir:    "./var/checkpoints",
 	},
 	Cleanup: &Cleanup{

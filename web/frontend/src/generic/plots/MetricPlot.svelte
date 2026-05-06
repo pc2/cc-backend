@@ -9,7 +9,6 @@
   - `height Number?`: The plot height [Default: 300]
   - `timestep Number`: The timestep used for X-axis rendering
   - `series [GraphQL.Series]`: The metric data object
-  - `useStatsSeries Bool?`: If this plot uses the statistics Min/Max/Median representation; automatically set to according bool [Default: false]
   - `statisticsSeries [GraphQL.StatisticsSeries]?`: Min/Max/Median representation of metric data [Default: null]
   - `cluster String?`: Cluster name of the parent job / data [Default: ""]
   - `subCluster String`: Name of the subCluster of the parent job
@@ -37,14 +36,11 @@
     height = 300,
     timestep,
     series,
-    useStatsSeries = false,
     statisticsSeries = null,
     cluster = "",
     subCluster,
     isShared = false,
     forNode = false,
-    numhwthreads = 0,
-    numaccs = 0,
     zoomState = null,
     thresholdState = null,
     extendedLegendData = null,
@@ -80,12 +76,11 @@
   const resampleTrigger = $derived(resampleConfig?.trigger ? Number(resampleConfig.trigger) : null);
   const resampleResolutions = $derived(resampleConfig?.resolutions ? [...resampleConfig.resolutions] : null);
   const resampleMinimum = $derived(resampleConfig?.resolutions ? Math.min(...resampleConfig.resolutions) : null);
+  const useStatsSeries = $derived(!!statisticsSeries); // Display Stats Series By Default if Exists
   const thresholds = $derived(findJobAggregationThresholds(
     subClusterTopology,
     metricConfig,
-    scope,
-    numhwthreads,
-    numaccs
+    scope
   ));
   const longestSeries = $derived.by(() => {
     if (useStatsSeries) {
@@ -247,11 +242,6 @@
     return pendingSeries;
   })
 
-  /* Effects */
-  $effect(() => {
-    if (!useStatsSeries && statisticsSeries != null) useStatsSeries = true;
-  })
-
   // This updates plot on all size changes if wrapper (== data) exists
   $effect(() => {
     if (plotWrapper) {
@@ -276,9 +266,7 @@
   function findJobAggregationThresholds(
     subClusterTopology,
     metricConfig,
-    scope,
-    numhwthreads,
-    numaccs
+    scope
   ) {
 
     if (!subClusterTopology || !metricConfig || !scope) {
@@ -303,22 +291,14 @@
     }
 
     if (metricConfig?.aggregation == "sum") {
-      // Scale Thresholds
-      let fraction;
-      if (numaccs > 0) fraction = subClusterTopology.accelerators.length / numaccs;
-      else if (numhwthreads > 0) fraction = subClusterTopology.core.length / numhwthreads;
-      else fraction = 1; // Fallback
-
       let divisor;
-      // Exclusive: Fraction = 1; Shared: Fraction > 1
-      if (scope == 'node')              divisor = fraction;
-      // Cap divisor at number of available sockets or domains
-      else if (scope == 'socket')       divisor = (fraction < subClusterTopology.socket.length) ? subClusterTopology.socket.length : fraction;
-      else if (scope == "memoryDomain") divisor = (fraction < subClusterTopology.memoryDomain.length) ? subClusterTopology.socket.length : fraction;
-      // Use Maximum Division for Smallest Scopes
-      else if (scope == "core")         divisor = subClusterTopology.core.length;
-      else if (scope == "hwthread")     divisor = subClusterTopology.core.length; // alt. name for core
-      else if (scope == "accelerator")  divisor = subClusterTopology.accelerators.length;
+      if (scope == 'node')              divisor = 1 // Node Scope: Always return unscaled (Maximum Scope)
+      // Partial Scopes: Get from Topologies
+      else if (scope == 'socket')       divisor = subClusterTopology?.socket?.length || 1;
+      else if (scope == "memoryDomain") divisor = subClusterTopology?.memoryDomain?.length || 1;
+      else if (scope == "core")         divisor = subClusterTopology?.core?.length || 1;
+      else if (scope == "hwthread")     divisor = subClusterTopology?.node?.length || 1;
+      else if (scope == "accelerator")  divisor = subClusterTopology?.accelerators?.length || 1;
       else {
         console.log('Unknown scope, return default aggregation thresholds for sum', scope)
         divisor = 1;

@@ -32,6 +32,7 @@
   let {
     clusters,
     presetCluster,
+    loadMe = false,
   } = $props();
 
   /* Const Init */
@@ -59,7 +60,7 @@
   /* Derived */
   let cluster = $derived(presetCluster);
   // States for Stacked charts
-  const statesTimed = $derived(queryStore({
+  const statesTimed = $derived(loadMe ? queryStore({
     client: client,
     query: gql`
       query ($filter: [NodeFilter!], $typeNode: String!, $typeHealth: String!) {
@@ -81,11 +82,11 @@
       typeHealth: "health"
     },
     requestPolicy: "network-only"
-  }));
+  }) : null);
 
   // Note: nodeMetrics are requested on configured $timestep resolution
   // Result: The latest 5 minutes (datapoints) for each node independent of job
-  const statusQuery = $derived(queryStore({
+  const statusQuery = $derived(loadMe ? queryStore({
     client: client,
     query: gql`
       query (
@@ -162,7 +163,6 @@
         jobsStatistics(
           filter: $jobFilter
           page: $paging
-          sortBy: TOTALJOBS
           groupBy: SUBCLUSTER
         ) {
           id
@@ -178,17 +178,17 @@
       metrics: ["flops_any", "mem_bw"], // Fixed names for roofline and status bars
       from: from.toISOString(),
       to: to.toISOString(),
-      jobFilter: [{ state: ["running"] }, { cluster: { eq: cluster } }],
+      jobFilter: [{ cluster: { eq: cluster } }, { state: ["running"] }],
       nodeFilter: { cluster: { eq: cluster }},
       paging: { itemsPerPage: -1, page: 1 }, // Get all: -1
       sorting: { field: "startTime", type: "col", order: "DESC" }
     },
     requestPolicy: "network-only"
-  }));
+  }) : null);
 
   /* Effects */
   $effect(() => {
-    if ($statusQuery.data) {
+    if ($statusQuery?.data) {
       let subClusters = clusters.find(
         (c) => c.name == cluster,
       ).subClusters;
@@ -294,8 +294,8 @@
         const flopsData = subclusterData[i].metrics.find((s) => s.name == "flops_any")
         const memBwData = subclusterData[i].metrics.find((s) => s.name == "mem_bw")
 
-        const f = flopsData.metric.series[0].statistics.avg
-        const m = memBwData.metric.series[0].statistics.avg
+        const f = flopsData?.metric?.series[0]?.statistics?.avg || 0
+        const m = memBwData?.metric?.series[0]?.statistics?.avg || 0
 
         let intensity = f / m
         if (Number.isNaN(intensity) || !Number.isFinite(intensity)) {
@@ -374,19 +374,19 @@
 <hr/>
 
 <!-- Node Stack Charts -->
-{#if $statesTimed.fetching}
+{#if $statesTimed?.fetching}
   <Row cols={1} class="text-center mt-3">
     <Col>
       <Spinner />
     </Col>
   </Row>
-{:else if $statesTimed.error}
+{:else if $statesTimed?.error}
   <Row cols={1} class="text-center mt-3">
     <Col>  
-      <Card body color="danger">States Timed: {$statesTimed.error.message}</Card>
+      <Card body color="danger">States Timed: {$statesTimed?.error?.message}</Card>
     </Col>
   </Row>
-{:else if $statesTimed.data}
+{:else if $statesTimed?.data}
   <Row cols={{ md: 2 , sm: 1}} class="mb-3 justify-content-center">
     <Col class="px-3 mt-2 mt-lg-0">
       <div>
@@ -409,14 +409,14 @@
       <div>
         {#key $statesTimed?.data?.healthStates}
           <h4 class="text-center">
-            {cluster.charAt(0).toUpperCase() + cluster.slice(1)} Health States Over Time
+            {cluster.charAt(0).toUpperCase() + cluster.slice(1)} Metric Health Over Time
           </h4>
           <Stacked
             data={$statesTimed?.data?.healthStates}
             xlabel="Time"
             ylabel="Nodes"
             yunit = "#Count"
-            title = "Health States"
+            title = "Metric Health"
             stateType = "Health"
           />
         {/key}
@@ -427,19 +427,19 @@
 
 <hr/>
 <!-- Gauges & Roofline per Subcluster-->
-{#if $statusQuery.fetching}
+{#if $statusQuery?.fetching}
   <Row cols={1} class="text-center mt-3">
     <Col>
       <Spinner />
     </Col>
   </Row>
-{:else if $statusQuery.error}
+{:else if $statusQuery?.error}
   <Row cols={1} class="text-center mt-3">
     <Col>  
-      <Card body color="danger">Status Query (Details): {$statusQuery.error.message}</Card>
+      <Card body color="danger">Status Query (Details): {$statusQuery?.error?.message}</Card>
     </Col>
   </Row>
-{:else if $statusQuery.data}
+{:else if $statusQuery?.data}
   {#each clusters.find((c) => c.name == cluster).subClusters as subCluster, i}
     <Row cols={{ lg: 3, md: 1 , sm: 1}} class="mb-3 justify-content-center">
       <Col class="px-3">

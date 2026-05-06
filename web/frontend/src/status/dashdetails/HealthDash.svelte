@@ -6,6 +6,7 @@
 -->
 
  <script>
+  import { onMount } from "svelte";
   import {
     Row,
     Col,
@@ -28,6 +29,7 @@
   /* Svelte 5 Props */
   let {
     presetCluster,
+    loadMe = false,
   } = $props();
 
   /* Const Init */
@@ -54,7 +56,7 @@
   /* Derived */
   let cluster = $derived(presetCluster);
 
-  const statusQuery = $derived(queryStore({
+  const statusQuery = $derived(loadMe ? queryStore({
     client: client,
     query: gql`
       query (
@@ -84,7 +86,7 @@
       sorting: querySorting,
     },
     requestPolicy: "network-only"
-  }));
+  }) : null);
 
   let healthTableData = $derived.by(() => {
     if ($statusQuery?.data) {
@@ -105,6 +107,12 @@
           pendingTableData = pendingTableData.filter((e) => e.healthState.includes(tableHealthFilter))
     }
     return pendingTableData
+  });
+
+  const refinedStateData = $derived.by(() => {
+    return $statusQuery?.data?.nodeStates.
+      filter((e) => ['allocated', 'reserved', 'idle', 'mixed','down', 'unknown'].includes(e.state)).
+      sort((a, b) => b.count - a.count)
   });
 
   const refinedHealthData = $derived.by(() => {
@@ -134,6 +142,9 @@
     healthTableData = [...pendingHealthData];
   }
 
+  /* On Mount */
+  onMount(() => sortBy('healthState'));
+
 </script>
 
 <!-- Refresher and space for other options -->
@@ -150,17 +161,17 @@
 
 <hr/>
 
-<!-- Node Health Pis, later Charts -->
-{#if $statusQuery.fetching}
+<!-- Node State and Metric Health Pis -->
+{#if $statusQuery?.fetching}
   <Row cols={1} class="text-center mt-3">
     <Col>
       <Spinner />
     </Col>
   </Row>
-{:else if $statusQuery.error}
+{:else if $statusQuery?.error}
   <Row cols={1} class="text-center mt-3">
     <Col>  
-      <Card body color="danger">Status Query (States): {$statusQuery.error.message}</Card>
+      <Card body color="danger">Status Query (States): {$statusQuery?.error?.message}</Card>
     </Col>
   </Row>
 {:else if $statusQuery?.data?.nodeStates}
@@ -211,7 +222,7 @@
       <div bind:clientWidth={pieWidth}>
         {#key refinedHealthData}
           <h4 class="text-center">
-            Current {cluster.charAt(0).toUpperCase() + cluster.slice(1)} Node Health
+            Current {cluster.charAt(0).toUpperCase() + cluster.slice(1)} Metric Health
           </h4>
           <Pie
             canvasId="hpcpie-health"
@@ -254,19 +265,19 @@
 <hr/>
 
 <!-- Tabular Info About Node States and Missing Metrics -->
-{#if $statusQuery.fetching}
+{#if $statusQuery?.fetching}
   <Row cols={1} class="text-center mt-3">
     <Col>
       <Spinner />
     </Col>
   </Row>
-{:else if $statusQuery.error}
+{:else if $statusQuery?.error}
   <Row cols={1} class="text-center mt-3">
     <Col>  
-      <Card body color="danger">Status Query (Details): {$statusQuery.error.message}</Card>
+      <Card body color="danger">Status Query (Details): {$statusQuery?.error?.message}</Card>
     </Col>
   </Row>
-{:else if $statusQuery.data}
+{:else if $statusQuery?.data}
   <Row>
     <Col>
       <Card>

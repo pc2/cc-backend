@@ -2,6 +2,7 @@
 // All rights reserved. This file is part of cc-backend.
 // Use of this source code is governed by a MIT-style
 // license that can be found in the LICENSE file.
+
 package repository
 
 import (
@@ -10,6 +11,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 
@@ -72,7 +77,11 @@ func (r *UserRepository) GetUser(username string) (*schema.User, error) {
 	if err := sq.Select("password", "ldap", "name", "roles", "email", "projects").From("hpc_user").
 		Where("hpc_user.username = ?", username).RunWith(r.DB).
 		QueryRow().Scan(&hashedPassword, &user.AuthSource, &name, &rawRoles, &email, &rawProjects); err != nil {
-		cclog.Warnf("Error while querying user '%v' from database", username)
+		if err != sql.ErrNoRows {
+			_, file, line, _ := runtime.Caller(1)
+			cclog.Warnf("Error while querying user '%v' from database (%s:%d): %v",
+				username, filepath.Base(file), line, err)
+		}
 		return nil, err
 	}
 
@@ -101,6 +110,7 @@ func (r *UserRepository) GetLdapUsernames() ([]string, error) {
 		cclog.Warn("Error while querying usernames")
 		return nil, err
 	}
+	defer rows.Close()
 
 	for rows.Next() {
 		var username string
@@ -122,11 +132,11 @@ func (r *UserRepository) GetLdapUsernames() ([]string, error) {
 // Required fields: Username, Roles
 // Optional fields: Name, Email, Password, Projects, AuthSource
 func (r *UserRepository) AddUser(user *schema.User) error {
-	rolesJson, _ := json.Marshal(user.Roles)
-	projectsJson, _ := json.Marshal(user.Projects)
+	rolesJSON, _ := json.Marshal(user.Roles)
+	projectsJSON, _ := json.Marshal(user.Projects)
 
 	cols := []string{"username", "roles", "projects"}
-	vals := []any{user.Username, string(rolesJson), string(projectsJson)}
+	vals := []any{user.Username, string(rolesJSON), string(projectsJSON)}
 
 	if user.Name != "" {
 		cols = append(cols, "name")
@@ -155,7 +165,7 @@ func (r *UserRepository) AddUser(user *schema.User) error {
 		return err
 	}
 
-	cclog.Infof("new user %#v created (roles: %s, auth-source: %d, projects: %s)", user.Username, rolesJson, user.AuthSource, projectsJson)
+	cclog.Infof("new user %#v created (roles: %s, auth-source: %d, projects: %s)", user.Username, rolesJSON, user.AuthSource, projectsJSON)
 
 	// DEPRECATED: SUPERSEDED BY NEW USER CONFIG - userConfig.go / web.go
 	defaultMetricsCfg, err := config.LoadDefaultMetricsConfig()
@@ -186,9 +196,30 @@ func (r *UserRepository) AddUser(user *schema.User) error {
 	return nil
 }
 
+// AddUserIfNotExists inserts a user only if the username does not already exist.
+// Uses INSERT OR IGNORE to avoid UNIQUE constraint errors when a user is
+// concurrently created (e.g., by a login while LDAP sync is running).
+// Unlike AddUser, this intentionally skips the deprecated default metrics config insertion.
+func (r *UserRepository) AddUserIfNotExists(user *schema.User) error {
+	rolesJSON, _ := json.Marshal(user.Roles)
+	projectsJSON, _ := json.Marshal(user.Projects)
+
+	cols := "username, name, roles, projects, ldap"
+	_, err := r.DB.Exec(
+		`INSERT OR IGNORE INTO hpc_user (`+cols+`) VALUES (?, ?, ?, ?, ?)`,
+		user.Username, user.Name, string(rolesJSON), string(projectsJSON), int(user.AuthSource))
+	return err
+}
+
+func sortedRoles(roles []string) []string {
+	cp := append([]string{}, roles...)
+	sort.Strings(cp)
+	return cp
+}
+
 func (r *UserRepository) UpdateUser(dbUser *schema.User, user *schema.User) error {
-	// user contains updated info, apply to dbuser
-	// TODO: Discuss updatable fields
+	// user contains updated info -> Apply to dbUser
+	// --- Simple Name Update ---
 	if dbUser.Name != user.Name {
 		if _, err := sq.Update("hpc_user").Set("name", user.Name).Where("hpc_user.username = ?", dbUser.Username).RunWith(r.DB).Exec(); err != nil {
 			cclog.Errorf("error while updating name of user '%s'", user.Username)
@@ -196,13 +227,73 @@ func (r *UserRepository) UpdateUser(dbUser *schema.User, user *schema.User) erro
 		}
 	}
 
-	// Toggled until greenlit
-	// if dbUser.HasRole(schema.RoleManager) && !reflect.DeepEqual(dbUser.Projects, user.Projects) {
-	// 	projects, _ := json.Marshal(user.Projects)
-	// 	if _, err := sq.Update("hpc_user").Set("projects", projects).Where("hpc_user.username = ?", dbUser.Username).RunWith(r.DB).Exec(); err != nil {
-	// 		return err
-	// 	}
-	// }
+	// --- Def Helpers ---
+	// Helper to update roles
+	updateRoles := func(roles []string) error {
+		rolesJSON, _ := json.Marshal(roles)
+		_, err := sq.Update("hpc_user").Set("roles", rolesJSON).Where("hpc_user.username = ?", dbUser.Username).RunWith(r.DB).Exec()
+		return err
+	}
+
+	// Helper to update projects
+	updateProjects := func(projects []string) error {
+		projectsJSON, _ := json.Marshal(projects)
+		_, err := sq.Update("hpc_user").Set("projects", projectsJSON).Where("hpc_user.username = ?", dbUser.Username).RunWith(r.DB).Exec()
+		return err
+	}
+
+	// Helper to clear projects
+	clearProjects := func() error {
+		_, err := sq.Update("hpc_user").Set("projects", "[]").Where("hpc_user.username = ?", dbUser.Username).RunWith(r.DB).Exec()
+		return err
+	}
+
+	// --- Manager Role Handling ---
+	if dbUser.HasRole(schema.RoleManager) && user.HasRole(schema.RoleManager) && !reflect.DeepEqual(dbUser.Projects, user.Projects) {
+		// Existing Manager: update projects
+		if err := updateProjects(user.Projects); err != nil {
+			return err
+		}
+	} else if dbUser.HasRole(schema.RoleUser) && user.HasRole(schema.RoleManager) && user.HasNotRoles([]schema.Role{schema.RoleAdmin}) {
+		// New Manager: update roles and projects
+		if err := updateRoles(user.Roles); err != nil {
+			return err
+		}
+		if err := updateProjects(user.Projects); err != nil {
+			return err
+		}
+	} else if dbUser.HasRole(schema.RoleManager) && user.HasNotRoles([]schema.Role{schema.RoleAdmin, schema.RoleManager}) {
+		// Remove Manager: update roles and clear projects
+		if err := updateRoles(user.Roles); err != nil {
+			return err
+		}
+		if err := clearProjects(); err != nil {
+			return err
+		}
+	}
+
+	// --- Support Role Handling ---
+	if dbUser.HasRole(schema.RoleUser) && dbUser.HasNotRoles([]schema.Role{schema.RoleSupport}) &&
+		user.HasRole(schema.RoleSupport) && user.HasNotRoles([]schema.Role{schema.RoleAdmin}) {
+		// New Support: update roles
+		if err := updateRoles(user.Roles); err != nil {
+			return err
+		}
+	} else if dbUser.HasRole(schema.RoleSupport) && user.HasNotRoles([]schema.Role{schema.RoleAdmin, schema.RoleSupport}) {
+		// Remove Support: update roles
+		if err := updateRoles(user.Roles); err != nil {
+			return err
+		}
+	}
+
+	// --- Fallback: sync any remaining role differences not covered above ---
+	// This handles admin role assignment/removal and any other combinations that
+	// the specific branches above do not cover (e.g. user→admin, admin→user).
+	if !reflect.DeepEqual(sortedRoles(dbUser.Roles), sortedRoles(user.Roles)) {
+		if err := updateRoles(user.Roles); err != nil {
+			return err
+		}
+	}
 
 	return nil
 }

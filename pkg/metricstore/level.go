@@ -42,6 +42,7 @@ package metricstore
 
 import (
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/ClusterCockpit/cc-lib/v2/schema"
@@ -180,6 +181,14 @@ func (l *Level) collectPaths(currentDepth, targetDepth int, currentPath []string
 //   - int:   Total number of buffers freed in this subtree
 //   - error: Non-nil on failure (propagated from children)
 func (l *Level) free(t int64) (int, error) {
+	n, _, err := l.freeAndCheckEmpty(t)
+	return n, err
+}
+
+// freeAndCheckEmpty performs free() and atomically checks if the level is empty
+// while still holding its own lock, avoiding a TOCTOU race between free() and
+// a separate isEmpty() call.
+func (l *Level) freeAndCheckEmpty(t int64) (int, bool, error) {
 	l.lock.Lock()
 	defer l.lock.Unlock()
 
@@ -192,21 +201,36 @@ func (l *Level) free(t int64) (int, error) {
 				if cap(b.data) != BufferCap {
 					b.data = make([]schema.Float, 0, BufferCap)
 				}
+				b.lastUsed = time.Now().Unix()
 				bufferPool.Put(b)
 				l.metrics[i] = nil
 			}
 		}
 	}
 
-	for _, l := range l.children {
-		m, err := l.free(t)
+	for key, child := range l.children {
+		m, empty, err := child.freeAndCheckEmpty(t)
 		n += m
 		if err != nil {
-			return n, err
+			return n, false, err
+		}
+		if empty {
+			delete(l.children, key)
 		}
 	}
 
-	return n, nil
+	// Check emptiness while still holding the lock
+	empty := len(l.children) == 0
+	if empty {
+		for _, b := range l.metrics {
+			if b != nil {
+				empty = false
+				break
+			}
+		}
+	}
+
+	return n, empty, nil
 }
 
 // forceFree removes the oldest buffer from each metric chain in the subtree.
@@ -236,12 +260,13 @@ func (l *Level) forceFree() (int, error) {
 			// If delme is true, it means 'b' itself (the head) was the oldest
 			// and needs to be removed from the slice.
 			if delme {
-				// Nil out fields to ensure no hanging references
-
 				b.next = nil
 				b.prev = nil
-				b.data = nil
-
+				if cap(b.data) != BufferCap {
+					b.data = make([]schema.Float, 0, BufferCap)
+				}
+				b.lastUsed = time.Now().Unix()
+				bufferPool.Put(b)
 				l.metrics[i] = nil
 			}
 		}
@@ -275,6 +300,7 @@ func (l *Level) sizeInBytes() int64 {
 	for _, b := range l.metrics {
 		if b != nil {
 			size += b.count() * int64(unsafe.Sizeof(schema.Float(0)))
+			size += b.bufferCount() * int64(unsafe.Sizeof(buffer{}))
 		}
 	}
 

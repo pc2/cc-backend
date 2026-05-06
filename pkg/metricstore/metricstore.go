@@ -8,7 +8,7 @@
 //
 // The package organizes metrics in a tree structure (cluster → host → component) and
 // provides concurrent read/write access to metric data with configurable aggregation strategies.
-// Background goroutines handle periodic checkpointing (JSON or Avro format), archiving old data,
+// Background goroutines handle periodic checkpointing (JSON or WAL/binary format), archiving old data,
 // and enforcing retention policies.
 //
 // Key features:
@@ -16,7 +16,7 @@
 //   - Hierarchical data organization (selectors)
 //   - Concurrent checkpoint/archive workers
 //   - Support for sum and average aggregation
-//   - NATS integration for metric ingestion
+//   - NATS integration for metric ingestion via InfluxDB line protocol
 package metricstore
 
 import (
@@ -113,7 +113,8 @@ type MemoryStore struct {
 //  6. Optionally subscribes to NATS for real-time metric ingestion
 //
 // Parameters:
-//   - rawConfig: JSON configuration for the metric store (see MetricStoreConfig)
+//   - rawConfig: JSON configuration for the metric store (see MetricStoreConfig); may be nil to use defaults
+//   - metrics: Map of metric names to their configurations (frequency and aggregation strategy)
 //   - wg: WaitGroup that will be incremented for each background goroutine started
 //
 // The function will call cclog.Fatal on critical errors during initialization.
@@ -172,7 +173,7 @@ func Init(rawConfig json.RawMessage, metrics map[string]MetricConfig, wg *sync.W
 	Retention(wg, ctx)
 	Checkpointing(wg, ctx)
 	CleanUp(wg, ctx)
-	DataStaging(wg, ctx)
+	WALStaging(wg, ctx)
 	MemoryUsageTracker(wg, ctx)
 
 	// Note: Signal handling has been removed from this function.
@@ -184,10 +185,11 @@ func Init(rawConfig json.RawMessage, metrics map[string]MetricConfig, wg *sync.W
 	shutdownFuncMu.Unlock()
 
 	if Keys.Subscriptions != nil {
-		err = ReceiveNats(ms, 1, ctx)
-		if err != nil {
-			cclog.Fatal(err)
-		}
+		wg.Go(func() {
+			if err := ReceiveNats(ms, Keys.NumWorkers, ctx); err != nil {
+				cclog.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -235,7 +237,7 @@ func InitMetrics(metrics map[string]MetricConfig) {
 // This function is safe for concurrent use after initialization.
 func GetMemoryStore() *MemoryStore {
 	if msInstance == nil {
-		cclog.Fatalf("[METRICSTORE]> MemoryStore not initialized!")
+		cclog.Warnf("[METRICSTORE]> MemoryStore not initialized!")
 	}
 
 	return msInstance
@@ -264,38 +266,58 @@ func (ms *MemoryStore) SetNodeProvider(provider NodeProvider) {
 //
 // The function will:
 //  1. Cancel the context to stop all background workers
-//  2. Close NATS message channels if using Avro format
+//  2. Close the WAL messages channel if using WAL format
 //  3. Write a final checkpoint to preserve in-memory data
 //  4. Log any errors encountered during shutdown
 //
 // Note: This function blocks until the final checkpoint is written.
 func Shutdown() {
+	totalStart := time.Now()
+
 	shutdownFuncMu.Lock()
 	defer shutdownFuncMu.Unlock()
 	if shutdownFunc != nil {
 		shutdownFunc()
 	}
+	cclog.Infof("[METRICSTORE]> Background workers cancelled (%v)", time.Since(totalStart))
 
-	if Keys.Checkpoints.FileFormat != "json" {
-		close(LineProtocolMessages)
+	if Keys.Checkpoints.FileFormat == "wal" {
+		// Signal producers to stop sending before closing channels,
+		// preventing send-on-closed-channel panics from in-flight NATS workers.
+		walShuttingDown.Store(true)
+		// Brief grace period for in-flight DecodeLine calls to complete.
+		time.Sleep(100 * time.Millisecond)
+
+		for _, ch := range walShardChs {
+			close(ch)
+		}
+		drainStart := time.Now()
+		WaitForWALStagingDrain()
+		cclog.Infof("[METRICSTORE]> WAL staging goroutines exited (%v)", time.Since(drainStart))
 	}
 
-	cclog.Infof("[METRICSTORE]> Writing to '%s'...\n", Keys.Checkpoints.RootDir)
+	cclog.Infof("[METRICSTORE]> Writing checkpoint to '%s'...", Keys.Checkpoints.RootDir)
+	checkpointStart := time.Now()
 	var files int
 	var err error
 
 	ms := GetMemoryStore()
 
-	if Keys.Checkpoints.FileFormat == "json" {
-		files, err = ms.ToCheckpoint(Keys.Checkpoints.RootDir, lastCheckpoint.Unix(), time.Now().Unix())
+	lastCheckpointMu.Lock()
+	from := lastCheckpoint
+	lastCheckpointMu.Unlock()
+
+	if Keys.Checkpoints.FileFormat == "wal" {
+		// WAL files are deleted per-host inside ToCheckpointWAL workers.
+		files, _, err = ms.ToCheckpointWAL(Keys.Checkpoints.RootDir, from.Unix(), time.Now().Unix())
 	} else {
-		files, err = GetAvroStore().ToCheckpoint(Keys.Checkpoints.RootDir, true)
+		files, err = ms.ToCheckpoint(Keys.Checkpoints.RootDir, from.Unix(), time.Now().Unix())
 	}
 
 	if err != nil {
-		cclog.Errorf("[METRICSTORE]> Writing checkpoint failed: %s\n", err.Error())
+		cclog.Errorf("[METRICSTORE]> Writing checkpoint failed: %s", err.Error())
 	}
-	cclog.Infof("[METRICSTORE]> Done! (%d files written)\n", files)
+	cclog.Infof("[METRICSTORE]> Done! (%d files written in %v, total shutdown: %v)", files, time.Since(checkpointStart), time.Since(totalStart))
 }
 
 // Retention starts a background goroutine that periodically frees old metric data.
@@ -312,9 +334,7 @@ func Shutdown() {
 func Retention(wg *sync.WaitGroup, ctx context.Context) {
 	ms := GetMemoryStore()
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		d, err := time.ParseDuration(Keys.RetentionInMemory)
 		if err != nil {
 			cclog.Fatal(err)
@@ -351,9 +371,12 @@ func Retention(wg *sync.WaitGroup, ctx context.Context) {
 				}
 
 				state.mu.Unlock()
+
+				// Clean up the buffer pool
+				bufferPool.Clean(state.lastRetentionTime)
 			}
 		}
-	}()
+	})
 }
 
 // MemoryUsageTracker starts a background goroutine that monitors memory usage.
@@ -374,17 +397,17 @@ func Retention(wg *sync.WaitGroup, ctx context.Context) {
 func MemoryUsageTracker(wg *sync.WaitGroup, ctx context.Context) {
 	ms := GetMemoryStore()
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		d := DefaultMemoryUsageTrackerInterval
+	wg.Go(func() {
+		normalInterval := DefaultMemoryUsageTrackerInterval
+		fastInterval := 30 * time.Second
 
-		if d <= 0 {
+		if normalInterval <= 0 {
 			return
 		}
 
-		ticker := time.NewTicker(d)
+		ticker := time.NewTicker(normalInterval)
 		defer ticker.Stop()
+		currentInterval := normalInterval
 
 		for {
 			select {
@@ -424,45 +447,59 @@ func MemoryUsageTracker(wg *sync.WaitGroup, ctx context.Context) {
 				if actualMemoryGB > float64(Keys.MemoryCap) {
 					cclog.Warnf("[METRICSTORE]> memory usage %.2f GB exceeds cap %d GB, starting emergency buffer freeing", actualMemoryGB, Keys.MemoryCap)
 
-					const maxIterations = 100
+					// Use progressive time-based Free with increasing threshold
+					// instead of ForceFree loop — fewer tree traversals, more effective
+					d, parseErr := time.ParseDuration(Keys.RetentionInMemory)
+					if parseErr != nil {
+						cclog.Errorf("[METRICSTORE]> cannot parse retention duration: %s", parseErr)
+					} else {
+						thresholds := []float64{0.75, 0.5, 0.25}
+						for _, fraction := range thresholds {
+							threshold := time.Now().Add(-time.Duration(float64(d) * fraction))
+							freed, freeErr := ms.Free(nil, threshold.Unix())
+							if freeErr != nil {
+								cclog.Errorf("[METRICSTORE]> error while freeing buffers at %.0f%% retention: %s", fraction*100, freeErr)
+							}
+							freedEmergency += freed
 
-					for i := range maxIterations {
-						if actualMemoryGB < float64(Keys.MemoryCap) {
-							break
-						}
-
-						freed, err := ms.ForceFree()
-						if err != nil {
-							cclog.Errorf("[METRICSTORE]> error while force-freeing buffers: %s", err)
-						}
-						if freed == 0 {
-							cclog.Errorf("[METRICSTORE]> no more buffers to free after %d emergency frees, memory usage %.2f GB still exceeds cap %d GB", freedEmergency, actualMemoryGB, Keys.MemoryCap)
-							break
-						}
-						freedEmergency += freed
-
-						if i%10 == 0 && freedEmergency > 0 {
+							bufferPool.Clear()
+							runtime.GC()
 							runtime.ReadMemStats(&mem)
 							actualMemoryGB = float64(mem.Alloc) / 1e9
+
+							if actualMemoryGB < float64(Keys.MemoryCap) {
+								break
+							}
 						}
 					}
 
-					// if freedEmergency > 0 {
-					// 	debug.FreeOSMemory()
-					// }
+					bufferPool.Clear()
+					debug.FreeOSMemory()
 
 					runtime.ReadMemStats(&mem)
 					actualMemoryGB = float64(mem.Alloc) / 1e9
 
 					if actualMemoryGB >= float64(Keys.MemoryCap) {
-						cclog.Errorf("[METRICSTORE]> after %d emergency frees, memory usage %.2f GB still at/above cap %d GB", freedEmergency, actualMemoryGB, Keys.MemoryCap)
+						cclog.Errorf("[METRICSTORE]> after emergency frees (%d buffers), memory usage %.2f GB still at/above cap %d GB", freedEmergency, actualMemoryGB, Keys.MemoryCap)
 					} else {
 						cclog.Infof("[METRICSTORE]> emergency freeing complete: %d buffers freed, memory now %.2f GB", freedEmergency, actualMemoryGB)
 					}
 				}
+
+				// Adaptive ticker: check more frequently when memory is high
+				memoryRatio := actualMemoryGB / float64(Keys.MemoryCap)
+				if memoryRatio > 0.8 && currentInterval != fastInterval {
+					ticker.Reset(fastInterval)
+					currentInterval = fastInterval
+					cclog.Infof("[METRICSTORE]> memory at %.0f%% of cap, switching to fast check interval (30s)", memoryRatio*100)
+				} else if memoryRatio <= 0.8 && currentInterval != normalInterval {
+					ticker.Reset(normalInterval)
+					currentInterval = normalInterval
+					cclog.Infof("[METRICSTORE]> memory at %.0f%% of cap, switching to normal check interval", memoryRatio*100)
+				}
 			}
 		}
-	}()
+	})
 }
 
 // Free removes metric data older than the given time while preserving data for active nodes.
@@ -676,16 +713,16 @@ func (m *MemoryStore) Read(selector util.Selector, metric string, from, to, reso
 		} else if from != cfrom || to != cto || len(data) != len(cdata) {
 			missingfront, missingback := int((from-cfrom)/minfo.Frequency), int((to-cto)/minfo.Frequency)
 			if missingfront != 0 {
-				return ErrDataDoesNotAlign
+				return ErrDataDoesNotAlignMissingFront
 			}
 
 			newlen := len(cdata) - missingback
 			if newlen < 1 {
-				return ErrDataDoesNotAlign
+				return ErrDataDoesNotAlignMissingBack
 			}
 			cdata = cdata[0:newlen]
 			if len(cdata) != len(data) {
-				return ErrDataDoesNotAlign
+				return ErrDataDoesNotAlignDataLenMismatch
 			}
 
 			from, to = cfrom, cto
@@ -731,6 +768,9 @@ func (m *MemoryStore) ForceFree() (int, error) {
 }
 
 func (m *MemoryStore) FreeAll() error {
+	m.root.lock.Lock()
+	defer m.root.lock.Unlock()
+
 	for k := range m.root.children {
 		delete(m.root.children, k)
 	}

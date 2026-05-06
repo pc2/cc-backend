@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -109,6 +110,29 @@ type JobClassTagger struct {
 	getStatistics func(job *schema.Job) (map[string]schema.JobStatistics, error)
 	// getMetricConfig retrieves metric configuration (limits) for a cluster
 	getMetricConfig func(cluster, subCluster string) map[string]*schema.Metric
+}
+
+// roundEnv returns a copy of env with all float64 values rounded to 2 decimal places.
+// Nested map[string]any and map[string]float64 values are recursed into.
+func roundEnv(env map[string]any) map[string]any {
+	rounded := make(map[string]any, len(env))
+	for k, v := range env {
+		switch val := v.(type) {
+		case float64:
+			rounded[k] = math.Round(val*100) / 100
+		case map[string]any:
+			rounded[k] = roundEnv(val)
+		case map[string]float64:
+			rm := make(map[string]float64, len(val))
+			for mk, mv := range val {
+				rm[mk] = math.Round(mv*100) / 100
+			}
+			rounded[k] = rm
+		default:
+			rounded[k] = v
+		}
+	}
+	return rounded
 }
 
 func (t *JobClassTagger) prepareRule(b []byte, fns string) {
@@ -309,7 +333,7 @@ func (t *JobClassTagger) Register() error {
 func (t *JobClassTagger) Match(job *schema.Job) {
 	jobStats, err := t.getStatistics(job)
 	metricsList := t.getMetricConfig(job.Cluster, job.SubCluster)
-	cclog.Infof("Enter match rule with %d rules for job %d", len(t.rules), job.JobID)
+	cclog.Debugf("Enter match rule with %d rules for job %d", len(t.rules), job.JobID)
 	if err != nil {
 		cclog.Errorf("job classification failed for job %d: %#v", job.JobID, err)
 		return
@@ -321,7 +345,7 @@ func (t *JobClassTagger) Match(job *schema.Job) {
 	for tag, ri := range t.rules {
 		env := make(map[string]any)
 		maps.Copy(env, ri.env)
-		cclog.Infof("Try to match rule %s for job %d", tag, job.JobID)
+		cclog.Debugf("Try to match rule %s for job %d", tag, job.JobID)
 
 		// Initialize environment
 		env["job"] = map[string]any{
@@ -339,7 +363,7 @@ func (t *JobClassTagger) Match(job *schema.Job) {
 		for _, m := range ri.metrics {
 			stats, ok := jobStats[m]
 			if !ok {
-				cclog.Errorf("job classification: missing metric '%s' for rule %s on job %d", m, tag, job.JobID)
+				cclog.Debugf("job classification: missing metric '%s' for rule %s on job %d", m, tag, job.JobID)
 				skipRule = true
 				break
 			}
@@ -364,12 +388,12 @@ func (t *JobClassTagger) Match(job *schema.Job) {
 		for _, r := range ri.requirements {
 			ok, err := expr.Run(r, env)
 			if err != nil {
-				cclog.Errorf("error running requirement for rule %s: %#v", tag, err)
+				cclog.Debugf("error running requirement for rule %s: %#v", tag, err)
 				requirementsMet = false
 				break
 			}
 			if !ok.(bool) {
-				cclog.Infof("requirement for rule %s not met", tag)
+				cclog.Debugf("requirement for rule %s not met", tag)
 				requirementsMet = false
 				break
 			}
@@ -383,7 +407,7 @@ func (t *JobClassTagger) Match(job *schema.Job) {
 		for _, v := range ri.variables {
 			value, err := expr.Run(v.expr, env)
 			if err != nil {
-				cclog.Errorf("error evaluating variable %s for rule %s: %#v", v.name, tag, err)
+				cclog.Debugf("error evaluating variable %s for rule %s: %#v", v.name, tag, err)
 				varError = true
 				break
 			}
@@ -399,7 +423,6 @@ func (t *JobClassTagger) Match(job *schema.Job) {
 			continue
 		}
 		if match.(bool) {
-			cclog.Info("Rule matches!")
 			if !t.repo.HasTag(id, t.tagType, tag) {
 				if _, err := t.repo.AddTagOrCreateDirect(id, t.tagType, tag); err != nil {
 					cclog.Errorf("failed to add tag '%s' to job %d: %v", tag, id, err)
@@ -409,13 +432,11 @@ func (t *JobClassTagger) Match(job *schema.Job) {
 
 			// process hint template
 			var msg bytes.Buffer
-			if err := ri.hint.Execute(&msg, env); err != nil {
+			if err := ri.hint.Execute(&msg, roundEnv(env)); err != nil {
 				cclog.Errorf("Template error: %s", err.Error())
 				continue
 			}
 			messages = append(messages, msg.String())
-		} else {
-			cclog.Info("Rule does not match!")
 		}
 	}
 
